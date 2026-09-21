@@ -1,0 +1,13 @@
+/spike/
+/data/
+/jellysync/data/
+.env
+*.db
+/web/node_modules/
+/internal/webui/static/assets/
+*.prv
+jellyfin-a/
+jellyfin-b/
+jellysync-a/
+jellysync-b/
+

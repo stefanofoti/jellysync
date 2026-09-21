@@ -1,0 +1,20 @@
+services:
+  jellysync:
+    image: ghcr.io/stefanofoti/jellysync:latest
+    container_name: jellysync
+    environment:
+      - NODE_ID=
+      # jellyfin-a is the container above, reached over the compose network.
+      - JELLYFIN_URL=
+      # From jellyfin-a: Dashboard -> Advanced -> API Keys. Fill in once the
+      # setup wizard has run, then `docker compose up -d` to apply.
+      - JELLYFIN_API_KEY=
+      - DB_PATH=/data/jellysync.db
+      - OUTPUT_DIR=/media/synced
+      - BASE_URL=http://jellysync:8080
+    volumes:
+      - ./jellysync/data:/data
+      - ./jellysync/media/synced:/media/synced
+    ports:
+      - "8098:8080"
+    restart: unless-stopped
