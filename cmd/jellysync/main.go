@@ -12,13 +12,21 @@ import (
 	"jellysync/internal/config"
 	"jellysync/internal/db"
 	"jellysync/internal/jellyfin"
+	"jellysync/internal/metrics"
 	"jellysync/internal/peers"
 	"jellysync/internal/proxy"
-	"jellysync/internal/strm"
+	"jellysync/internal/settings"
+	"jellysync/internal/syncrun"
+	"jellysync/internal/syncstatus"
+	"jellysync/internal/synctrigger"
 	"jellysync/internal/webui"
 )
 
-const version = "dev"
+// version identifies this node's build to peers over /health, so a remote
+// jellysync can tell what version it's talking to. Overridden at build time
+// via -ldflags "-X main.version=...": the Docker build stamps it from the
+// VERSION file, and a plain "go build"/"go run" leaves it as "dev".
+var version = "dev"
 
 func main() {
 	startedAt := time.Now()
@@ -49,7 +57,18 @@ func main() {
 	go registry.RunHeartbeat(context.Background())
 	log.Printf("tracking %d configured peer(s)", len(cfg.Peers))
 
-	go runSyncAndReconcileLoop(context.Background(), store, jf, registry, cfg.Strm)
+	collector, err := metrics.NewCollector(context.Background(), store)
+	if err != nil {
+		log.Fatalf("metrics: %v", err)
+	}
+	go collector.Run(context.Background())
+
+	tracker := syncstatus.NewTracker()
+	// Buffered size 1: a manual "sync now" trigger just needs to guarantee
+	// the loop wakes up promptly, not that every trigger while a sync is
+	// already running queues up a second one.
+	triggerCh := make(chan struct{}, 1)
+	go runSyncAndReconcileLoop(context.Background(), store, jf, registry, cfg.Strm, tracker, triggerCh)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -61,11 +80,23 @@ func main() {
 		})
 	})
 	mux.HandleFunc("/api/v1/catalog", catalog.Handler(jf, cfg.Strm.OutputDir))
-	mux.HandleFunc("GET /api/v1/proxy/stream/{peerID}/{itemID}", proxy.Handler(jf, registry))
+	mux.HandleFunc("GET /api/v1/proxy/stream/{peerID}/{itemID}", proxy.Handler(jf, registry, cfg.NodeID, collector))
 	mux.HandleFunc("GET /api/v1/peers", peers.ListHandler(registry))
 	mux.HandleFunc("POST /api/v1/peers", peers.AddHandler(registry))
 	mux.HandleFunc("DELETE /api/v1/peers/{peerID}", peers.RemoveHandler(registry))
 	mux.HandleFunc("GET /api/v1/items", catalog.ItemsHandler(store))
+	mux.HandleFunc("GET /api/v1/stats", catalog.StatsHandler(store))
+	mux.HandleFunc("GET /api/v1/traffic", metrics.TrafficHandler(collector))
+	mux.HandleFunc("GET /metrics", metrics.OpenMetricsHandler(store, collector, registry))
+	mux.HandleFunc("GET /api/v1/settings", settings.GetHandler(store))
+	mux.HandleFunc("PUT /api/v1/settings", settings.PutHandler(store))
+	mux.HandleFunc("GET /api/v1/sync/status", syncstatus.StatusHandler(tracker))
+	mux.HandleFunc("POST /api/v1/sync/trigger/{peerID}", synctrigger.Handler(registry, tracker, func() {
+		select {
+		case triggerCh <- struct{}{}:
+		default:
+		}
+	}))
 
 	webHandler, err := webui.Handler()
 	if err != nil {
@@ -77,22 +108,28 @@ func main() {
 	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
 }
 
-// runSyncAndReconcileLoop syncs the catalog with all peers, then reconciles
-// .strm files against the result, on a fixed interval. Reconcile always
-// runs right after Sync so a fresh election is reflected in .strm files
-// within the same cycle rather than racing an independent timer.
-func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm) {
+// runSyncAndReconcileLoop runs syncrun.RunLocal (Jellyfin refresh, then
+// catalog.Sync, then strm.Reconcile — Reconcile always runs right after
+// Sync so a fresh election is reflected in .strm files within the same
+// cycle rather than racing an independent timer) on the user-configured
+// interval, or immediately whenever triggerCh fires (a manual "sync now").
+func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, tracker *syncstatus.Tracker, triggerCh <-chan struct{}) {
 	for {
-		if err := catalog.Sync(ctx, store, jf, registry, strmCfg.OutputDir); err != nil {
-			log.Printf("catalog sync: %v", err)
-		} else if err := strm.Reconcile(ctx, store, jf, strmCfg); err != nil {
-			log.Printf("strm reconcile: %v", err)
+		if err := syncrun.RunLocal(ctx, store, jf, registry, strmCfg, tracker); err != nil {
+			log.Printf("sync: %v", err)
+		}
+
+		interval, err := settings.GetSyncInterval(ctx, store)
+		if err != nil {
+			log.Printf("reading sync interval: %v", err)
+			interval = settings.DefaultSyncInterval
 		}
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(catalog.SyncInterval):
+		case <-triggerCh:
+		case <-time.After(interval):
 		}
 	}
 }

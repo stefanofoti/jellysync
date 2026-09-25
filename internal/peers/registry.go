@@ -4,6 +4,7 @@ package peers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -32,9 +33,11 @@ const (
 )
 
 type Peer struct {
-	ID    string
-	URL   string
-	State State
+	ID      string
+	URL     string
+	State   State
+	Name    string // last-known /health "node_id" reported by this peer; display label only, "" until first successful probe
+	Version string // last-known /health "version" reported by this peer; "" until first successful probe
 
 	missed int
 }
@@ -74,7 +77,7 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Re
 		}
 	}
 
-	rows, err := db.QueryContext(ctx, `SELECT id, url, state FROM peers`)
+	rows, err := db.QueryContext(ctx, `SELECT id, url, state, version, name FROM peers`)
 	if err != nil {
 		return nil, fmt.Errorf("loading peers: %w", err)
 	}
@@ -82,7 +85,7 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Re
 	for rows.Next() {
 		var p Peer
 		var state string
-		if err := rows.Scan(&p.ID, &p.URL, &state); err != nil {
+		if err := rows.Scan(&p.ID, &p.URL, &state, &p.Version, &p.Name); err != nil {
 			return nil, fmt.Errorf("scanning peer: %w", err)
 		}
 		p.State = State(state)
@@ -95,19 +98,54 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Re
 	return r, nil
 }
 
+// Probe checks that url's /health endpoint answers 200 within
+// heartbeatTimeout, and returns the "node_id" (display name) and "version"
+// it reports (both empty if the peer is running a build old enough not to
+// include them — that's not an error, just unknown). Used both as the
+// add-peer handshake and by the heartbeat loop, so "reachable" means the
+// same thing in both places.
+func (r *Registry) Probe(ctx context.Context, url string) (name string, version string, err error) {
+	reqCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url+"/health", nil)
+	if err != nil {
+		return "", "", fmt.Errorf("building request: %w", err)
+	}
+	resp, err := r.http.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("unhealthy: status %d", resp.StatusCode)
+	}
+
+	var body struct {
+		NodeID  string `json:"node_id"`
+		Version string `json:"version"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.NodeID, body.Version, nil
+}
+
 // AddPeer inserts (or updates) a peer and starts heartbeating it
-// immediately.
-func (r *Registry) AddPeer(ctx context.Context, id, url string) error {
+// immediately. Callers wanting a reachability handshake first should call
+// Probe themselves — AddPeer itself doesn't check, so it stays usable for
+// seeding known-good peers (e.g. from config) without a network round trip.
+// name and version are whatever Probe returned (or "" if the caller has
+// none yet); the next heartbeat corrects both either way.
+func (r *Registry) AddPeer(ctx context.Context, id, url, name, version string) error {
 	url = strings.TrimRight(url, "/")
 	if _, err := r.db.ExecContext(ctx, `
-		INSERT INTO peers (id, url, state) VALUES (?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET url = excluded.url
-	`, id, url, StateOnline); err != nil {
+		INSERT INTO peers (id, url, state, name, version) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET url = excluded.url, name = excluded.name, version = excluded.version
+	`, id, url, StateOnline, name, version); err != nil {
 		return fmt.Errorf("adding peer %s: %w", id, err)
 	}
 
 	r.mu.Lock()
-	r.peers[id] = &Peer{ID: id, URL: url, State: StateOnline}
+	r.peers[id] = &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version}
 	r.mu.Unlock()
 
 	r.startHeartbeat(id)
@@ -217,18 +255,8 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 		return
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url+"/health", nil)
-	healthy := false
-	if err == nil {
-		resp, doErr := r.http.Do(req)
-		if doErr == nil {
-			healthy = resp.StatusCode == http.StatusOK
-			resp.Body.Close()
-		}
-	}
+	name, version, probeErr := r.Probe(ctx, url)
+	healthy := probeErr == nil
 
 	r.mu.Lock()
 	p, ok = r.peers[id]
@@ -240,6 +268,12 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	if healthy {
 		p.missed = 0
 		p.State = StateOnline
+		if version != "" {
+			p.Version = version
+		}
+		if name != "" {
+			p.Name = name
+		}
 	} else {
 		p.missed++
 		switch {
@@ -250,6 +284,8 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 		}
 	}
 	newState := p.State
+	newVersion := p.Version
+	newName := p.Name
 	r.mu.Unlock()
 
 	if newState != prevState {
@@ -259,8 +295,8 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	var execErr error
 	if healthy {
 		_, execErr = r.db.ExecContext(ctx, `
-			UPDATE peers SET state = ?, last_seen_at = ? WHERE id = ?
-		`, string(newState), time.Now().Unix(), id)
+			UPDATE peers SET state = ?, last_seen_at = ?, version = ?, name = ? WHERE id = ?
+		`, string(newState), time.Now().Unix(), newVersion, newName, id)
 	} else {
 		_, execErr = r.db.ExecContext(ctx, `
 			UPDATE peers SET state = ? WHERE id = ?

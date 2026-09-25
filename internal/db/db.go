@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS peers (
 	id           TEXT PRIMARY KEY,
 	url          TEXT NOT NULL,
 	state        TEXT NOT NULL DEFAULT 'ONLINE',
-	last_seen_at INTEGER
+	last_seen_at INTEGER,
+	version      TEXT NOT NULL DEFAULT '',
+	name         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS catalog_items (
@@ -34,6 +36,18 @@ CREATE TABLE IF NOT EXISTS catalog_items (
 	episode_number   INTEGER NOT NULL DEFAULT 0,
 	updated_at       INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS peer_traffic (
+	peer_id   TEXT NOT NULL,
+	direction TEXT NOT NULL,
+	bytes     INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (peer_id, direction)
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 `
 
 // seriesColumns are added to catalog_items via ALTER TABLE for databases
@@ -46,6 +60,13 @@ var seriesColumns = []string{
 	"series_name TEXT NOT NULL DEFAULT ''",
 	"season_number INTEGER NOT NULL DEFAULT 0",
 	"episode_number INTEGER NOT NULL DEFAULT 0",
+}
+
+// peerColumns are added to peers via ALTER TABLE for databases created
+// before peer version tracking existed, same rationale as seriesColumns.
+var peerColumns = []string{
+	"version TEXT NOT NULL DEFAULT ''",
+	"name TEXT NOT NULL DEFAULT ''",
 }
 
 // Open creates the parent directory if needed, opens the SQLite file at
@@ -72,7 +93,11 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("applying schema to %s: %w", path, err)
 	}
 
-	if err := addMissingColumns(db); err != nil {
+	if err := addMissingColumns(db, "catalog_items", seriesColumns); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating schema: %w", err)
+	}
+	if err := addMissingColumns(db, "peers", peerColumns); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
@@ -80,11 +105,12 @@ func Open(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// addMissingColumns adds any catalog_items column from seriesColumns that
-// isn't already present, for databases created before series support
-// existed.
-func addMissingColumns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(catalog_items)`)
+// addMissingColumns adds any column from columns that isn't already present
+// on table, for databases created before that column existed. SQLite has no
+// "ADD COLUMN IF NOT EXISTS", so each is added individually guarded by a
+// PRAGMA table_info check.
+func addMissingColumns(db *sql.DB, table string, columns []string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
 		return err
 	}
@@ -105,13 +131,13 @@ func addMissingColumns(db *sql.DB) error {
 		return err
 	}
 
-	for _, col := range seriesColumns {
+	for _, col := range columns {
 		colName, _, _ := strings.Cut(col, " ")
 		if existing[colName] {
 			continue
 		}
-		if _, err := db.Exec(`ALTER TABLE catalog_items ADD COLUMN ` + col); err != nil {
-			return fmt.Errorf("adding column %s: %w", colName, err)
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + col); err != nil {
+			return fmt.Errorf("adding column %s to %s: %w", colName, table, err)
 		}
 	}
 	return nil

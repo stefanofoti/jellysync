@@ -11,8 +11,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
+COPY VERSION ./VERSION
 COPY --from=webbuild /internal/webui/static ./internal/webui/static
-RUN go build -o /jellysync ./cmd/jellysync
+RUN go build -ldflags "-X main.version=$(cat VERSION)" -o /jellysync ./cmd/jellysync
 
 FROM alpine:3.20
 COPY --from=build /jellysync /jellysync

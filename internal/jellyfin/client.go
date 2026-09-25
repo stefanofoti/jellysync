@@ -93,6 +93,50 @@ func (c *Client) RefreshLibrary(ctx context.Context) error {
 	return nil
 }
 
+// libraryScanTaskKey is the stable (non-localized) Key Jellyfin assigns its
+// built-in "Scan Media Library" scheduled task, as opposed to its display
+// Name which varies by server language.
+const libraryScanTaskKey = "RefreshLibrary"
+
+type scheduledTask struct {
+	Key                       string   `json:"Key"`
+	State                     string   `json:"State"`
+	CurrentProgressPercentage *float64 `json:"CurrentProgressPercentage"`
+}
+
+// LibraryScanProgress reports whether Jellyfin's library scan task is
+// currently running and, if so, its completion percentage (0-100). Both
+// come back zero-valued if the task isn't running or isn't found.
+func (c *Client) LibraryScanProgress(ctx context.Context) (percent int, running bool, err error) {
+	req, err := c.NewRequest(ctx, http.MethodGet, "/ScheduledTasks", nil)
+	if err != nil {
+		return 0, false, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("listing scheduled tasks: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, false, fmt.Errorf("listing scheduled tasks: status %d", resp.StatusCode)
+	}
+	var tasks []scheduledTask
+	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
+		return 0, false, fmt.Errorf("decoding scheduled tasks: %w", err)
+	}
+	for _, t := range tasks {
+		if t.Key != libraryScanTaskKey {
+			continue
+		}
+		running = t.State == "Running"
+		if t.CurrentProgressPercentage != nil {
+			percent = int(*t.CurrentProgressPercentage)
+		}
+		break
+	}
+	return percent, running, nil
+}
+
 // NewDownloadRequest builds an authenticated request for an item's raw file.
 // The caller is responsible for setting a Range header before sending it and
 // for streaming the response body without buffering it fully in memory.
