@@ -3,8 +3,15 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
+
+// defaultStreamBufferKB is the read/write buffer size used to relay
+// proxied stream bytes (see internal/proxy). Both sides of that relay are
+// network sockets, so Go can't use sendfile/splice — a bigger buffer means
+// fewer, larger syscalls per second for a given bitrate.
+const defaultStreamBufferKB = 256
 
 type Config struct {
 	NodeID     string
@@ -13,6 +20,8 @@ type Config struct {
 	Jellyfin   Jellyfin
 	Strm       Strm
 	Peers      []Peer
+	// StreamBufferKB is the proxy relay's copy buffer size, in KiB.
+	StreamBufferKB int
 }
 
 type Jellyfin struct {
@@ -56,6 +65,15 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.Peers = peers
+
+	streamBufferKB, err := envIntOr("STREAM_BUFFER_KB", defaultStreamBufferKB)
+	if err != nil {
+		return nil, err
+	}
+	if streamBufferKB <= 0 {
+		return nil, fmt.Errorf("STREAM_BUFFER_KB must be positive, got %d", streamBufferKB)
+	}
+	cfg.StreamBufferKB = streamBufferKB
 
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("NODE_ID is required")
@@ -105,4 +123,16 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envIntOr(k string, def int) (int, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid integer %q", k, v)
+	}
+	return n, nil
 }

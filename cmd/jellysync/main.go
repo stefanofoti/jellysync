@@ -80,7 +80,7 @@ func main() {
 		})
 	})
 	mux.HandleFunc("/api/v1/catalog", catalog.Handler(jf, cfg.Strm.OutputDir))
-	mux.HandleFunc("GET /api/v1/proxy/stream/{peerID}/{itemID}", proxy.Handler(jf, registry, cfg.NodeID, collector))
+	mux.HandleFunc("GET /api/v1/proxy/stream/{peerID}/{itemID}", proxy.Handler(jf, registry, cfg.NodeID, collector, cfg.StreamBufferKB))
 	mux.HandleFunc("GET /api/v1/peers", peers.ListHandler(registry))
 	mux.HandleFunc("POST /api/v1/peers", peers.AddHandler(registry))
 	mux.HandleFunc("DELETE /api/v1/peers/{peerID}", peers.RemoveHandler(registry))

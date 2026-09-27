@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"jellysync/internal/jellyfin"
@@ -38,10 +39,24 @@ const (
 // jellysync node at ".../stream/local/{itemID}", which serves it from ITS
 // local Jellyfin the same way. This node never talks to a peer's Jellyfin
 // directly.
-func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, collector *metrics.Collector) http.HandlerFunc {
+//
+// streamBufferKB sizes the read/write buffer used to relay bytes, in KiB.
+// Both sides of the relay are network sockets (never a file), so Go can't
+// hand the copy off to sendfile/splice — every byte takes a userspace
+// read+write syscall pair, and a bigger buffer means fewer, larger
+// syscalls per second for a given bitrate.
+func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, collector *metrics.Collector, streamBufferKB int) http.HandlerFunc {
 	client := &http.Client{
 		Transport: &http.Transport{
 			ResponseHeaderTimeout: responseHeaderTimeout,
+		},
+	}
+
+	bufferSize := streamBufferKB * 1024
+	copyBufferPool := sync.Pool{
+		New: func() any {
+			b := make([]byte, bufferSize)
+			return &b
 		},
 	}
 
@@ -108,9 +123,11 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 		}
 		w.WriteHeader(resp.StatusCode)
 
-		// Stream, don't buffer: io.Copy uses a small internal buffer and
-		// never loads the whole file into memory.
-		n, err := io.Copy(w, body)
+		// Stream, don't buffer: this never loads the whole file into memory,
+		// just a fixed-size chunk at a time (see copyBufferSize).
+		buf := copyBufferPool.Get().(*[]byte)
+		n, err := io.CopyBuffer(w, body, *buf)
+		copyBufferPool.Put(buf)
 		collector.RecordBytes(trafficPeer, trafficDir, n)
 		if err != nil {
 			log.Printf("proxy: peer=%s item=%s: copy: %v", peerID, itemID, err)

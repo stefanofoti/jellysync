@@ -94,6 +94,7 @@ Everything is configured as environment variables on the `jellysync` service in 
 | `OUTPUT_DIR` | Folder jellysync writes pointer files into. Must be a folder your Jellyfin also has mounted, as a library. |
 | `BASE_URL` | The address *your own* Jellyfin uses to reach jellysync. If you used the included `docker-compose.yml` as-is, leave this at `http://jellysync:8080`. |
 | `PEERS` | Optional — a starting list of peers as `id=url,id=url`, in case you'd rather edit this than use the dashboard. The dashboard's Peers list is the same data either way, and additions there persist across restarts even if they're not set here. |
+| `STREAM_BUFFER_KB` | Optional, defaults to `256`. Size (in KiB) of the buffer used to relay streamed bytes between peers. Rarely needs changing — a bigger buffer trades a little memory per active stream for fewer syscalls, which can help CPU usage on constrained hardware serving high-bitrate streams. |
 
 jellysync always listens on `:8080` inside its container — to use a different port on your host, change the host side of the `ports` mapping (e.g. `"9000:8080"`), not the container side.
 
