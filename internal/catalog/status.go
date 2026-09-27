@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -123,6 +124,40 @@ func parsePageParams(r *http.Request) (limit, offset int, err error) {
 	return limit, offset, nil
 }
 
+// ownerFilter turns the optional `owners` query param (comma-separated
+// owner keys: "local" and/or peer ids, the same keys ownerOf uses on the
+// dashboard) into a SQL condition plus its args. With no `owners` param
+// every row passes; with `owners=` (present but empty) none do, so a caller
+// that has unchecked every source gets an empty page rather than everything.
+func ownerFilter(r *http.Request) (string, []any) {
+	q := r.URL.Query()
+	if !q.Has("owners") {
+		return "1 = 1", nil
+	}
+	var includeLocal bool
+	var peerIDs []any
+	for _, o := range strings.Split(q.Get("owners"), ",") {
+		switch o = strings.TrimSpace(o); o {
+		case "":
+		case "local":
+			includeLocal = true
+		default:
+			peerIDs = append(peerIDs, o)
+		}
+	}
+	conds := make([]string, 0, 2)
+	if includeLocal {
+		conds = append(conds, "local = 1")
+	}
+	if len(peerIDs) > 0 {
+		conds = append(conds, "(local = 0 AND primary_peer_id IN (?"+strings.Repeat(", ?", len(peerIDs)-1)+"))")
+	}
+	if len(conds) == 0 {
+		return "1 = 0", nil
+	}
+	return "(" + strings.Join(conds, " OR ") + ")", peerIDs
+}
+
 type errBadRequest string
 
 func (e errBadRequest) Error() string { return string(e) }
@@ -178,6 +213,8 @@ func serveAllItems(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 // servePagedMovies paginates directly over catalog_items rows: each movie
 // is exactly one row, so a page of movies is just LIMIT/OFFSET by name.
+// Filtered by `owners` (see ownerFilter) before paginating, so every page is
+// full and the total matches the filter.
 func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	limit, offset, err := parsePageParams(r)
 	if err != nil {
@@ -185,8 +222,10 @@ func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	ownerCond, ownerArgs := ownerFilter(r)
+
 	var total int
-	if err := db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM catalog_items WHERE media_type = 'movie'`).Scan(&total); err != nil {
+	if err := db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM catalog_items WHERE media_type = 'movie' AND `+ownerCond, ownerArgs...).Scan(&total); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -194,10 +233,10 @@ func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	rows, err := db.QueryContext(r.Context(), `
 		SELECT `+itemColumns+`
 		FROM catalog_items
-		WHERE media_type = 'movie'
+		WHERE media_type = 'movie' AND `+ownerCond+`
 		ORDER BY name
 		LIMIT ? OFFSET ?
-	`, limit, offset)
+	`, append(ownerArgs, limit, offset)...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -221,6 +260,11 @@ func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 // SeriesEpisodesHandler, once the caller actually needs them (e.g. the
 // dashboard expanding that series' row) — so this response stays bounded by
 // `limit` regardless of how many episodes those series have.
+//
+// `owners` (see ownerFilter) filters episodes before grouping: a series is
+// listed iff at least one of its episodes comes from a selected source, and
+// its counts cover only those episodes — matching what the dashboard shows
+// once the row is expanded and its episodes are filtered the same way.
 func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	limit, offset, err := parsePageParams(r)
 	if err != nil {
@@ -228,12 +272,14 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	ownerCond, ownerArgs := ownerFilter(r)
+
 	var total int
 	if err := db.QueryRowContext(r.Context(), `
 		SELECT COUNT(*) FROM (
-			SELECT 1 FROM catalog_items WHERE media_type = 'episode' GROUP BY `+seriesKeyExpr+`
+			SELECT 1 FROM catalog_items WHERE media_type = 'episode' AND `+ownerCond+` GROUP BY `+seriesKeyExpr+`
 		)
-	`).Scan(&total); err != nil {
+	`, ownerArgs...).Scan(&total); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -241,11 +287,11 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	rows, err := db.QueryContext(r.Context(), `
 		SELECT `+seriesKeyExpr+` AS skey, MIN(series_name), SUM(local), COUNT(*)
 		FROM catalog_items
-		WHERE media_type = 'episode'
+		WHERE media_type = 'episode' AND `+ownerCond+`
 		GROUP BY skey
 		ORDER BY MIN(series_name)
 		LIMIT ? OFFSET ?
-	`, limit, offset)
+	`, append(ownerArgs, limit, offset)...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

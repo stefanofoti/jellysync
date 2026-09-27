@@ -246,3 +246,60 @@ func TestItemsHandlerMoviesLimitCappedAtMax(t *testing.T) {
 		t.Errorf("limit = %d, want capped at %d", page.Limit, maxItemsLimit)
 	}
 }
+
+func seedOwned(t *testing.T, db *sql.DB, globalID, mediaType string, local bool, peerID, seriesName string) {
+	t.Helper()
+	var peer any
+	if peerID != "" {
+		peer = peerID
+	}
+	_, err := db.Exec(`
+		INSERT INTO catalog_items (global_id, name, media_type, local, primary_peer_id, series_global_id, series_name, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+	`, globalID, globalID, mediaType, local, peer, seriesName, seriesName)
+	if err != nil {
+		t.Fatalf("seed %s: %v", globalID, err)
+	}
+}
+
+func TestItemsHandlerOwnersFilter(t *testing.T) {
+	db := testDB(t)
+	seedOwned(t, db, "m-local", "movie", true, "", "")
+	seedOwned(t, db, "m-alice", "movie", false, "alice", "")
+	seedOwned(t, db, "m-bob", "movie", false, "bob", "")
+	// Show A: local + alice episodes; Show B: bob only.
+	seedOwned(t, db, "a-e1", "episode", true, "", "Show A")
+	seedOwned(t, db, "a-e2", "episode", false, "alice", "Show A")
+	seedOwned(t, db, "a-e3", "episode", false, "alice", "Show A")
+	seedOwned(t, db, "b-e1", "episode", false, "bob", "Show B")
+
+	movieCases := map[string]int{
+		"":                  3,
+		"&owners=local":     1,
+		"&owners=alice,bob": 2,
+		"&owners=local,bob": 2,
+		"&owners=":          0,
+		"&owners=carol":     0,
+	}
+	for q, want := range movieCases {
+		page := getItemsPage(t, db, "/api/v1/items?type=movie"+q)
+		if page.Total != want || len(page.Items) != want {
+			t.Errorf("movies %q: total=%d items=%d, want %d", q, page.Total, len(page.Items), want)
+		}
+	}
+
+	page := getSeriesSummaryPage(t, db, "/api/v1/items?type=series&owners=bob")
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].SeriesName != "Show B" {
+		t.Errorf("series owners=bob: %+v", page)
+	}
+
+	page = getSeriesSummaryPage(t, db, "/api/v1/items?type=series&owners=alice")
+	if page.Total != 1 || page.Items[0].SeriesName != "Show A" || page.Items[0].TotalCount != 2 || page.Items[0].LocalCount != 0 {
+		t.Errorf("series owners=alice: %+v", page)
+	}
+
+	page = getSeriesSummaryPage(t, db, "/api/v1/items?type=series&owners=")
+	if page.Total != 0 || len(page.Items) != 0 {
+		t.Errorf("series owners=: %+v", page)
+	}
+}

@@ -26,18 +26,35 @@
   let syncStatus = $state({}); // peer id ("local" included) -> {state, percent, started_at, finished_at, error}
   let triggering = $state(new Set()); // scopes currently mid-request: "local" | "remote" | "both"
 
+  // Source filtering happens server-side (the `owners` param), before
+  // pagination, so every page is full and the series tab is filtered too —
+  // series summary rows carry no per-episode ownership to filter by here.
+  // Only sent while some source is unchecked, so an owner the dropdown
+  // doesn't list yet is never hidden by accident.
   async function fetchItemsPage(type, offset, limit) {
-    const res = await fetch(`/api/v1/items?type=${type}&limit=${limit}&offset=${offset}`);
+    const owners = filterSources.every((id) => enabledPeers.has(id))
+      ? ""
+      : `&owners=${[...enabledPeers].map(encodeURIComponent).join(",")}`;
+    const res = await fetch(`/api/v1/items?type=${type}&limit=${limit}&offset=${offset}${owners}`);
     if (!res.ok) throw new Error(await res.text());
     return res.json();
   }
 
+  // Only the latest request per tab may land: a periodic refresh started
+  // before a filter toggle must not overwrite the page the toggle loaded.
+  let movieSeq = 0;
+  let seriesSeq = 0;
+
   async function loadMovies(offset = moviePage.offset) {
-    moviePage = await fetchItemsPage("movie", offset, moviePage.limit);
+    const seq = ++movieSeq;
+    const page = await fetchItemsPage("movie", offset, moviePage.limit);
+    if (seq === movieSeq) moviePage = page;
   }
 
   async function loadSeries(offset = seriesPage.offset) {
-    seriesPage = await fetchItemsPage("series", offset, seriesPage.limit);
+    const seq = ++seriesSeq;
+    const page = await fetchItemsPage("series", offset, seriesPage.limit);
+    if (seq === seriesSeq) seriesPage = page;
   }
 
   function goToPage(type, offset) {
@@ -68,9 +85,9 @@
       stats = await statsRes.json();
       traffic = await trafficRes.json();
       syncStatus = await syncStatusRes.json();
+      syncFilterSources();
       await Promise.all([loadMovies(moviePage.offset), loadSeries(seriesPage.offset)]);
       error = "";
-      syncFilterSources();
     } catch (e) {
       error = String(e);
     }
@@ -289,9 +306,8 @@
   // Groups one series' cached episodes into seasons, filtered to the
   // currently enabled peers. Reads seriesEpisodesCache/enabledPeers directly
   // so Svelte re-runs it wherever it's called in the template as either
-  // changes — series themselves aren't peer-filtered (a series row stays
-  // visible even if every episode is currently hidden), only their episode
-  // list is, per the current filter selection.
+  // changes. Series rows themselves are filtered by the backend (see
+  // fetchItemsPage); this applies the same filter to the episode list.
   function seasonsFor(key) {
     const entry = seriesEpisodesCache.get(key);
     if (!entry || entry.status !== "loaded") return [];
@@ -339,34 +355,33 @@
   let enabledPeers = $state(new Set(["local"]));
   let filterOpen = $state(false);
 
-  // Built from configured peers plus whatever's in the currently loaded
-  // movie page and any series episodes fetched so far — series summary rows
-  // carry no per-item ownership (they're aggregated across every peer
-  // offering that series), so they can't contribute here the way movie rows
-  // do; a peer that only ever offers series episodes still shows up once its
-  // peer id is registered, via the `peers` loop below.
+  // Built from configured peers plus every owner in the library stats, which
+  // cover the whole catalog (not just the loaded page) — so a peer that was
+  // removed but still owns items stays filterable. "unknown" (an item with no
+  // primary peer) isn't an owner the `owners` param can select, so it's left
+  // out.
   let filterSources = $derived.by(() => {
     const set = new Set(["local"]);
     for (const p of peers) set.add(p.id);
-    for (const it of moviePage.items) {
-      if (!it.local && it.primary_peer_id) set.add(it.primary_peer_id);
-    }
-    for (const entry of seriesEpisodesCache.values()) {
-      for (const episode of entry.episodes) {
-        if (!episode.local && episode.primary_peer_id) set.add(episode.primary_peer_id);
-      }
+    for (const s of stats) {
+      if (s.owner !== "unknown") set.add(s.owner);
     }
     return [...set].sort((a, b) => (a === "local" ? -1 : b === "local" ? 1 : peerLabel(a).localeCompare(peerLabel(b))));
   });
+
+  // Sources the filter has already offered. Only a source seen for the
+  // first time gets auto-enabled — one the user unchecked must stay unchecked
+  // across refreshes, not be switched back on every 5s.
+  let seenSources = new Set(["local"]);
 
   function syncFilterSources() {
     const next = new Set(enabledPeers);
     let changed = false;
     for (const id of filterSources) {
-      if (!next.has(id)) {
-        next.add(id);
-        changed = true;
-      }
+      if (seenSources.has(id)) continue;
+      seenSources.add(id);
+      next.add(id);
+      changed = true;
     }
     if (changed) enabledPeers = next;
   }
@@ -379,25 +394,27 @@
       next.add(id);
     }
     enabledPeers = next;
+    // The filter changes what's on every page, so the current offsets no
+    // longer mean anything — start both tabs over from the first page.
+    Promise.all([loadMovies(0), loadSeries(0)]).catch((e) => (error = String(e)));
   }
 
   // ---- Movies/series tabs -------------------------------------------
   let activeTab = $state("movies");
 
   // Movies need no grouping — each row in moviePage.items is already one
-  // list entry, in the order the backend paginated them (by name).
+  // list entry, in the order the backend paginated (and source-filtered)
+  // them, by name.
   let movieRows = $derived(
-    moviePage.items
-      .filter((item) => enabledPeers.has(ownerOf(item)))
-      .map((item) => ({ type: "movie", key: item.global_id, name: item.name, item })),
+    moviePage.items.map((item) => ({ type: "movie", key: item.global_id, name: item.name, item })),
   );
 
   // seriesPage.items is already one summary entry per series (series_key,
   // series_name, local_count, total_count — see servePagedSeries), in the
-  // order the backend paginated them by name. Not peer-filtered here: a
-  // series row stays visible regardless of which peer(s) offer it, since its
-  // counts are aggregated across every offering peer; only its episode list,
-  // once expanded, is filtered by enabledPeers (see seasonsFor).
+  // order the backend paginated them by name. Already source-filtered by the
+  // backend: a series is listed iff one of its episodes comes from an enabled
+  // source, and its counts cover only those episodes — the same set its
+  // expanded episode list shows (see seasonsFor).
   let seriesRows = $derived(
     seriesPage.items.map((item) => ({
       type: "series",
@@ -750,7 +767,7 @@
                 {/each}
               {/if}
             {:else}
-              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No series in this library.</td></tr>
+              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No series match the current filter.</td></tr>
             {/each}
           {/if}
         </tbody>
