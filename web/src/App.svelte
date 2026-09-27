@@ -226,14 +226,72 @@
 
   let expandedSeries = $state(new Set());
 
+  // Episodes for one series are fetched lazily, the first time its row is
+  // expanded, from GET /api/v1/items/series/episodes?key= — the paginated
+  // series list itself only carries per-series counts (see servePagedSeries
+  // in internal/catalog/status.go), not episode rows. Keyed by series_key;
+  // {status: "loading"|"loaded"|"error", episodes}.
+  let seriesEpisodesCache = $state(new Map());
+
+  async function ensureSeriesEpisodesLoaded(key) {
+    const entry = seriesEpisodesCache.get(key);
+    if (entry && (entry.status === "loaded" || entry.status === "loading")) return;
+
+    const loading = new Map(seriesEpisodesCache);
+    loading.set(key, { status: "loading", episodes: [] });
+    seriesEpisodesCache = loading;
+
+    try {
+      const res = await fetch(`/api/v1/items/series/episodes?key=${encodeURIComponent(key)}`);
+      if (!res.ok) throw new Error(await res.text());
+      const episodes = await res.json();
+      const loaded = new Map(seriesEpisodesCache);
+      loaded.set(key, { status: "loaded", episodes });
+      seriesEpisodesCache = loaded;
+    } catch (e) {
+      const failed = new Map(seriesEpisodesCache);
+      failed.set(key, { status: "error", episodes: [], error: String(e) });
+      seriesEpisodesCache = failed;
+    }
+  }
+
   function toggleSeries(key) {
     const next = new Set(expandedSeries);
     if (next.has(key)) {
       next.delete(key);
     } else {
       next.add(key);
+      ensureSeriesEpisodesLoaded(key);
     }
     expandedSeries = next;
+  }
+
+  // Groups one series' cached episodes into seasons, filtered to the
+  // currently enabled peers. Reads seriesEpisodesCache/enabledPeers directly
+  // so Svelte re-runs it wherever it's called in the template as either
+  // changes — series themselves aren't peer-filtered (a series row stays
+  // visible even if every episode is currently hidden), only their episode
+  // list is, per the current filter selection.
+  function seasonsFor(key) {
+    const entry = seriesEpisodesCache.get(key);
+    if (!entry || entry.status !== "loaded") return [];
+    const bySeason = new Map();
+    for (const episode of entry.episodes) {
+      if (!enabledPeers.has(ownerOf(episode))) continue;
+      const number = episode.season_number ?? 0;
+      let list = bySeason.get(number);
+      if (!list) {
+        list = [];
+        bySeason.set(number, list);
+      }
+      list.push(episode);
+    }
+    return [...bySeason.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([number, episodes]) => ({
+        number,
+        episodes: episodes.sort((a, b) => (a.episode_number ?? 0) - (b.episode_number ?? 0)),
+      }));
   }
 
   function seasonLabel(number) {
@@ -261,14 +319,22 @@
   let enabledPeers = $state(new Set(["local"]));
   let filterOpen = $state(false);
 
-  // Built from the currently loaded movie/series pages, not the whole
-  // catalog — a peer that only offers items outside the loaded pages won't
-  // show up here until its items are paged into view.
+  // Built from configured peers plus whatever's in the currently loaded
+  // movie page and any series episodes fetched so far — series summary rows
+  // carry no per-item ownership (they're aggregated across every peer
+  // offering that series), so they can't contribute here the way movie rows
+  // do; a peer that only ever offers series episodes still shows up once its
+  // peer id is registered, via the `peers` loop below.
   let filterSources = $derived.by(() => {
     const set = new Set(["local"]);
     for (const p of peers) set.add(p.id);
-    for (const it of [...moviePage.items, ...seriesPage.items]) {
+    for (const it of moviePage.items) {
       if (!it.local && it.primary_peer_id) set.add(it.primary_peer_id);
+    }
+    for (const entry of seriesEpisodesCache.values()) {
+      for (const episode of entry.episodes) {
+        if (!episode.local && episode.primary_peer_id) set.add(episode.primary_peer_id);
+      }
     }
     return [...set].sort((a, b) => (a === "local" ? -1 : b === "local" ? 1 : a.localeCompare(b)));
   });
@@ -306,50 +372,21 @@
       .map((item) => ({ type: "movie", key: item.global_id, name: item.name, item })),
   );
 
-  // Grouping happens client-side against the current series page's flat
-  // episode rows — series_global_id (falling back to series_name) is the
-  // same cross-node-stable key the backend groups pages by, so it's also
-  // what ties episodes back to the same series here. The backend guarantees
-  // every episode of a series on this page belongs to the same page, so
-  // grouping never splits a series across pages. Filtering by enabledPeers
-  // happens per-episode before grouping, so a series with every episode
-  // from a disabled peer simply never produces a row.
-  let seriesRows = $derived.by(() => {
-    const seriesByKey = new Map();
-    const rows = [];
-
-    for (const item of seriesPage.items) {
-      if (!enabledPeers.has(ownerOf(item))) continue;
-
-      const key = item.series_global_id || item.series_name || "unknown";
-      let group = seriesByKey.get(key);
-      if (!group) {
-        group = { type: "series", key, name: item.series_name || "Unknown series", seasons: new Map() };
-        seriesByKey.set(key, group);
-        rows.push(group);
-      }
-      let season = group.seasons.get(item.season_number ?? 0);
-      if (!season) {
-        season = [];
-        group.seasons.set(item.season_number ?? 0, season);
-      }
-      season.push(item);
-    }
-
-    for (const group of seriesByKey.values()) {
-      group.seasons = [...group.seasons.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([number, episodes]) => ({
-          number,
-          episodes: episodes.sort((a, b) => (a.episode_number ?? 0) - (b.episode_number ?? 0)),
-        }));
-      group.localCount = group.seasons.reduce((n, s) => n + s.episodes.filter((e) => e.local).length, 0);
-      group.totalCount = group.seasons.reduce((n, s) => n + s.episodes.length, 0);
-    }
-
-    rows.sort((a, b) => a.name.localeCompare(b.name));
-    return rows;
-  });
+  // seriesPage.items is already one summary entry per series (series_key,
+  // series_name, local_count, total_count — see servePagedSeries), in the
+  // order the backend paginated them by name. Not peer-filtered here: a
+  // series row stays visible regardless of which peer(s) offer it, since its
+  // counts are aggregated across every offering peer; only its episode list,
+  // once expanded, is filtered by enabledPeers (see seasonsFor).
+  let seriesRows = $derived(
+    seriesPage.items.map((item) => ({
+      type: "series",
+      key: item.series_key,
+      name: item.series_name || "Unknown series",
+      localCount: item.local_count,
+      totalCount: item.total_count,
+    })),
+  );
 
   // ---- Per-item reachability test + mini player ----------------------
   let testResults = $state({}); // global_id -> {status: "testing"|"ok"|"fail", detail}
@@ -624,7 +661,17 @@
                 <td class="px-4 py-2"></td>
               </tr>
               {#if expandedSeries.has(row.key)}
-                {#each row.seasons as season (season.number)}
+                {@const cacheEntry = seriesEpisodesCache.get(row.key)}
+                {#if cacheEntry?.status === "loading"}
+                  <tr class="border-b border-neutral-800/60 last:border-0 bg-neutral-900/30">
+                    <td class="px-4 py-2 pl-9 text-neutral-500 text-xs" colspan="4">Loading episodes…</td>
+                  </tr>
+                {:else if cacheEntry?.status === "error"}
+                  <tr class="border-b border-neutral-800/60 last:border-0 bg-neutral-900/30">
+                    <td class="px-4 py-2 pl-9 text-red-400 text-xs" colspan="4">Failed to load episodes: {cacheEntry.error}</td>
+                  </tr>
+                {/if}
+                {#each seasonsFor(row.key) as season (season.number)}
                   <tr class="border-b border-neutral-800/60 last:border-0 bg-neutral-900/30">
                     <td class="px-4 py-1.5 pl-9 text-neutral-500 text-xs" colspan="4">{seasonLabel(season.number)}</td>
                   </tr>
@@ -669,7 +716,7 @@
                 {/each}
               {/if}
             {:else}
-              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No series match the current filter.</td></tr>
+              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No series in this library.</td></tr>
             {/each}
           {/if}
         </tbody>

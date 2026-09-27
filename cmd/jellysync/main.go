@@ -85,6 +85,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/peers", peers.AddHandler(registry))
 	mux.HandleFunc("DELETE /api/v1/peers/{peerID}", peers.RemoveHandler(registry))
 	mux.HandleFunc("GET /api/v1/items", catalog.ItemsHandler(store))
+	mux.HandleFunc("GET /api/v1/items/series/episodes", catalog.SeriesEpisodesHandler(store))
 	mux.HandleFunc("GET /api/v1/stats", catalog.StatsHandler(store))
 	mux.HandleFunc("GET /api/v1/traffic", metrics.TrafficHandler(collector))
 	mux.HandleFunc("GET /metrics", metrics.OpenMetricsHandler(store, collector, registry))

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"strings"
 )
 
 const (
@@ -49,6 +48,29 @@ type itemsPage struct {
 	Limit  int       `json:"limit"`
 	Offset int       `json:"offset"`
 }
+
+// seriesSummaryDTO is one list entry on the series tab: counts only, no
+// episode rows. The dashboard fetches a series' actual episodes on demand
+// (see SeriesEpisodesHandler) when its row is expanded, rather than having
+// them embedded in the paginated list up front.
+type seriesSummaryDTO struct {
+	SeriesKey  string `json:"series_key"`
+	SeriesName string `json:"series_name"`
+	LocalCount int    `json:"local_count"`
+	TotalCount int    `json:"total_count"`
+}
+
+type seriesSummaryPage struct {
+	Items  []seriesSummaryDTO `json:"items"`
+	Total  int                `json:"total"`
+	Limit  int                `json:"limit"`
+	Offset int                `json:"offset"`
+}
+
+// seriesKeyExpr groups catalog_items episode rows into series: by
+// series_global_id when present (the cross-node-stable key), falling back to
+// series_name for older rows / providerless series.
+const seriesKeyExpr = `COALESCE(NULLIF(series_global_id, ''), series_name)`
 
 func scanItemRows(rows *sql.Rows) ([]itemDTO, error) {
 	items := make([]itemDTO, 0)
@@ -110,10 +132,13 @@ func (e errBadRequest) Error() string { return string(e) }
 // format, which only ever describes this node's own local library).
 //
 // With no `type` query param it returns the full flat array, unchanged from
-// before pagination existed. With `type=movie` or `type=series` it paginates
-// over that tab's list entries (via `limit`/`offset`) and wraps the result
-// in an itemsPage envelope carrying the total entry count, so a caller can
-// render a pager without fetching the whole catalog.
+// before pagination existed. With `type=movie` it paginates over movie rows
+// (via `limit`/`offset`) and wraps the result in an itemsPage envelope
+// carrying the total entry count, so a caller can render a pager without
+// fetching the whole catalog. With `type=series` it paginates over distinct
+// series instead, returning summary counts rather than episode rows — see
+// servePagedSeries and SeriesEpisodesHandler for the per-series episode
+// fetch this is meant to be paired with.
 func ItemsHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("type") {
@@ -191,11 +216,11 @@ func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 // servePagedSeries paginates over distinct series, not raw rows: a series
 // is spread across one row per episode (grouped by series_global_id,
-// falling back to series_name exactly like the dashboard's client-side
-// grouping does), so a page of series has to be picked first and then
-// expanded back out to every episode row belonging to it — otherwise a
-// LIMIT/OFFSET on raw rows would cut a series in half across a page
-// boundary.
+// falling back to series_name). Each page entry is a count-only summary —
+// episode rows for a given series are fetched separately, on demand, via
+// SeriesEpisodesHandler, once the caller actually needs them (e.g. the
+// dashboard expanding that series' row) — so this response stays bounded by
+// `limit` regardless of how many episodes those series have.
 func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	limit, offset, err := parsePageParams(r)
 	if err != nil {
@@ -203,20 +228,18 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	const seriesKey = `COALESCE(NULLIF(series_global_id, ''), series_name)`
-
 	var total int
 	if err := db.QueryRowContext(r.Context(), `
 		SELECT COUNT(*) FROM (
-			SELECT 1 FROM catalog_items WHERE media_type = 'episode' GROUP BY `+seriesKey+`
+			SELECT 1 FROM catalog_items WHERE media_type = 'episode' GROUP BY `+seriesKeyExpr+`
 		)
 	`).Scan(&total); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	keyRows, err := db.QueryContext(r.Context(), `
-		SELECT `+seriesKey+` AS skey
+	rows, err := db.QueryContext(r.Context(), `
+		SELECT `+seriesKeyExpr+` AS skey, MIN(series_name), SUM(local), COUNT(*)
 		FROM catalog_items
 		WHERE media_type = 'episode'
 		GROUP BY skey
@@ -227,51 +250,59 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	keys := make([]string, 0, limit)
-	for keyRows.Next() {
-		var k string
-		if err := keyRows.Scan(&k); err != nil {
-			keyRows.Close()
+	defer rows.Close()
+
+	items := make([]seriesSummaryDTO, 0)
+	for rows.Next() {
+		var it seriesSummaryDTO
+		if err := rows.Scan(&it.SeriesKey, &it.SeriesName, &it.LocalCount, &it.TotalCount); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		keys = append(keys, k)
+		items = append(items, it)
 	}
-	if err := keyRows.Err(); err != nil {
-		keyRows.Close()
+	if err := rows.Err(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	keyRows.Close()
 
-	items := make([]itemDTO, 0)
-	if len(keys) > 0 {
-		placeholders := make([]string, len(keys))
-		args := make([]any, len(keys))
-		for i, k := range keys {
-			placeholders[i] = "?"
-			args[i] = k
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(seriesSummaryPage{Items: items, Total: total, Limit: limit, Offset: offset})
+}
+
+// SeriesEpisodesHandler serves GET /api/v1/items/series/episodes?key=<key>:
+// every episode row belonging to one series, keyed the same way
+// servePagedSeries groups its pages (COALESCE(series_global_id,
+// series_name)). The dashboard calls this lazily when a series row is
+// expanded, instead of the paginated series list embedding every episode of
+// every series on the page up front.
+func SeriesEpisodesHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "missing key", http.StatusBadRequest)
+			return
 		}
 
 		rows, err := db.QueryContext(r.Context(), `
 			SELECT `+itemColumns+`
 			FROM catalog_items
-			WHERE media_type = 'episode' AND `+seriesKey+` IN (`+strings.Join(placeholders, ",")+`)
-			ORDER BY series_name, season_number, episode_number
-		`, args...)
+			WHERE media_type = 'episode' AND `+seriesKeyExpr+` = ?
+			ORDER BY season_number, episode_number
+		`, key)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
 
-		items, err = scanItemRows(rows)
+		items, err := scanItemRows(rows)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(itemsPage{Items: items, Total: total, Limit: limit, Offset: offset})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(items)
+	}
 }

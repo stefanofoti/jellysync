@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -131,33 +132,90 @@ func TestItemsHandlerMoviesPagination(t *testing.T) {
 	}
 }
 
-func TestItemsHandlerSeriesPagination_KeepsEpisodesTogether(t *testing.T) {
+func getSeriesSummaryPage(t *testing.T, db *sql.DB, url string) seriesSummaryPage {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	rec := httptest.NewRecorder()
+	ItemsHandler(db)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s: status %d: %s", url, rec.Code, rec.Body.String())
+	}
+	var page seriesSummaryPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return page
+}
+
+func TestItemsHandlerSeriesPagination_ReturnsOneSummaryPerSeries(t *testing.T) {
 	db := testDB(t)
 	seedSeries(t, db, "Show A", 3)
 	seedSeries(t, db, "Show B", 2)
 	seedSeries(t, db, "Show C", 4)
 
-	page := getItemsPage(t, db, "/api/v1/items?type=series&limit=1&offset=0")
+	page := getSeriesSummaryPage(t, db, "/api/v1/items?type=series&limit=1&offset=0")
 	if page.Total != 3 {
 		t.Errorf("total = %d, want 3", page.Total)
 	}
-	if len(page.Items) != 3 {
-		t.Fatalf("Show A has 3 episodes, all must land on its page; got %d items", len(page.Items))
+	if len(page.Items) != 1 {
+		t.Fatalf("limit=1 must return exactly 1 series summary regardless of episode count; got %d items", len(page.Items))
 	}
-	for _, it := range page.Items {
-		if it.SeriesName != "Show A" {
-			t.Errorf("page 0 leaked episode from series %q", it.SeriesName)
-		}
+	if page.Items[0].SeriesName != "Show A" || page.Items[0].TotalCount != 3 {
+		t.Errorf("unexpected summary: %+v", page.Items[0])
 	}
 
-	page2 := getItemsPage(t, db, "/api/v1/items?type=series&limit=1&offset=1")
-	if len(page2.Items) != 2 {
-		t.Fatalf("Show B has 2 episodes; got %d items", len(page2.Items))
+	page2 := getSeriesSummaryPage(t, db, "/api/v1/items?type=series&limit=1&offset=1")
+	if len(page2.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(page2.Items))
 	}
-	for _, it := range page2.Items {
-		if it.SeriesName != "Show B" {
-			t.Errorf("page 1 leaked episode from series %q", it.SeriesName)
+	if page2.Items[0].SeriesName != "Show B" || page2.Items[0].TotalCount != 2 {
+		t.Errorf("unexpected summary: %+v", page2.Items[0])
+	}
+}
+
+func TestSeriesEpisodesHandler(t *testing.T) {
+	db := testDB(t)
+	seedSeries(t, db, "Show A", 3)
+	seedSeries(t, db, "Show B", 2)
+
+	summary := getSeriesSummaryPage(t, db, "/api/v1/items?type=series&limit=10&offset=0")
+	var showAKey string
+	for _, it := range summary.Items {
+		if it.SeriesName == "Show A" {
+			showAKey = it.SeriesKey
 		}
+	}
+	if showAKey == "" {
+		t.Fatalf("Show A not found in summary: %+v", summary.Items)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/items/series/episodes?key="+url.QueryEscape(showAKey), nil)
+	rec := httptest.NewRecorder()
+	SeriesEpisodesHandler(db)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var episodes []itemDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &episodes); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(episodes) != 3 {
+		t.Fatalf("got %d episodes, want 3", len(episodes))
+	}
+	for _, ep := range episodes {
+		if ep.SeriesName != "Show A" {
+			t.Errorf("leaked episode from series %q", ep.SeriesName)
+		}
+	}
+}
+
+func TestSeriesEpisodesHandlerMissingKey(t *testing.T) {
+	db := testDB(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/items/series/episodes", nil)
+	rec := httptest.NewRecorder()
+	SeriesEpisodesHandler(db)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status %d, want 400", rec.Code)
 	}
 }
 
