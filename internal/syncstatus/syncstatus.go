@@ -19,8 +19,24 @@ const (
 	StateUnreachable State = "unreachable"
 )
 
+// Stage labels which step of a running sync is currently in progress. Only
+// Stage == StageScanning carries a meaningful Percent (Jellyfin reports
+// real scan progress); the other stages have no measurable progress of
+// their own, so the UI shows them as indeterminate activity instead of a
+// stale or fabricated percentage. Empty means either not running, or a
+// peer whose jellysync build predates this field (best-effort: it still
+// reports Percent, just without a stage to interpret it by).
+type Stage string
+
+const (
+	StageScanning Stage = "scanning"        // waiting on Jellyfin's own library scan task
+	StageCatalog  Stage = "syncing_catalog" // fetching and merging peer catalogs
+	StageWriting  Stage = "writing_files"   // reconciling .strm files on disk
+)
+
 type Status struct {
 	State      State     `json:"state"`
+	Stage      Stage     `json:"stage,omitempty"`
 	Percent    int       `json:"percent"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`

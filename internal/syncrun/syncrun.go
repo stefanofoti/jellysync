@@ -34,7 +34,7 @@ const (
 // re-offered to peers. tracker's "local" entry is updated throughout.
 func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, tracker *syncstatus.Tracker) error {
 	started := time.Now()
-	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, StartedAt: started})
+	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageScanning, StartedAt: started})
 
 	if err := jf.RefreshLibrary(ctx); err != nil {
 		err = fmt.Errorf("refreshing jellyfin library: %w", err)
@@ -47,11 +47,14 @@ func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *pe
 		return err
 	}
 
+	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageCatalog, StartedAt: started})
 	if err := catalog.Sync(ctx, db, jf, registry, strmCfg.OutputDir); err != nil {
 		err = fmt.Errorf("catalog sync: %w", err)
 		fail(tracker, started, err)
 		return err
 	}
+
+	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageWriting, StartedAt: started})
 	if err := strm.Reconcile(ctx, db, jf, strmCfg); err != nil {
 		err = fmt.Errorf("strm reconcile: %w", err)
 		fail(tracker, started, err)
@@ -79,7 +82,7 @@ func pollScan(ctx context.Context, jf *jellyfin.Client, tracker *syncstatus.Trac
 			log.Printf("syncrun: checking scan progress: %v", err)
 		case running:
 			seenRunning = true
-			tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Percent: percent, StartedAt: started})
+			tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageScanning, Percent: percent, StartedAt: started})
 		case seenRunning, time.Since(started) > scanStartGrace:
 			return nil
 		}

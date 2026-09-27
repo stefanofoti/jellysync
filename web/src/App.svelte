@@ -192,6 +192,21 @@
     return "bg-neutral-700";
   }
 
+  // Only the "scanning" stage carries a real, measured percentage (from
+  // Jellyfin's own scan-progress API). Other stages, and older peers that
+  // predate the stage field, have no meaningful percent to show — an
+  // indeterminate bar communicates "still working" without faking a number.
+  function syncShowsPercent(status) {
+    return !status.stage || status.stage === "scanning";
+  }
+
+  function syncStageLabel(stage) {
+    if (stage === "scanning") return "scanning library";
+    if (stage === "syncing_catalog") return "syncing catalog";
+    if (stage === "writing_files") return "writing files";
+    return "";
+  }
+
   // ---- Library + traffic stats ---------------------------------------
   function formatBytes(n) {
     if (!n) return "0 B";
@@ -867,13 +882,19 @@
               <div class="text-sm">
                 <div class="flex items-center justify-between gap-2 mb-1">
                   <span class="truncate">{peerLabel(target.id)}</span>
-                  <span class={`rounded px-2 py-0.5 text-xs ${syncStateColor(status.state)}`}>{status.state}</span>
+                  <span class={`rounded px-2 py-0.5 text-xs ${syncStateColor(status.state)}`}>
+                    {status.state}{status.state === "running" && syncStageLabel(status.stage) ? ` · ${syncStageLabel(status.stage)}` : ""}
+                  </span>
                 </div>
                 <div class="h-1.5 rounded bg-neutral-800 overflow-hidden">
-                  <div
-                    class={`h-full ${syncBarColor(status.state)}`}
-                    style={`width: ${status.state === "success" ? 100 : status.percent}%`}
-                  ></div>
+                  {#if status.state === "running" && !syncShowsPercent(status)}
+                    <div class="h-full w-2/5 rounded bg-blue-500 sync-bar-indeterminate"></div>
+                  {:else}
+                    <div
+                      class={`h-full rounded transition-[width] duration-500 ease-out ${syncBarColor(status.state)}`}
+                      style={`width: ${status.state === "success" ? 100 : status.percent}%`}
+                    ></div>
+                  {/if}
                 </div>
                 {#if status.error}
                   <div class="text-xs text-red-400 mt-1 break-words">{status.error}</div>

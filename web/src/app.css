@@ -1,1 +1,16 @@
 @import "tailwindcss";
+
+/* Sync progress bar: phases with no measured percent (catalog sync, strm
+   writes) show a sliding highlight instead of a stalled/fake percentage. */
+@keyframes sync-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
+.sync-bar-indeterminate {
+  animation: sync-indeterminate 1.1s ease-in-out infinite;
+}
