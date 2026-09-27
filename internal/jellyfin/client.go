@@ -194,6 +194,40 @@ type rawItem struct {
 	SeriesName        string            `json:"SeriesName"`
 	ParentIndexNumber int               `json:"ParentIndexNumber"`
 	IndexNumber       int               `json:"IndexNumber"`
+
+	// LocationType/IsVirtualItem/MediaSources exist to filter out
+	// placeholder items injected by plugins like Jellyseerr's "request"
+	// integration (e.g. a fake "favorite this to request it" movie). Those
+	// have no backing file, so treating them as real media would produce a
+	// .strm that can never stream. See isRealMedia.
+	LocationType  string           `json:"LocationType"`
+	IsVirtualItem bool             `json:"IsVirtualItem"`
+	MediaSources  []rawMediaSource `json:"MediaSources"`
+}
+
+type rawMediaSource struct {
+	Path string `json:"Path"`
+}
+
+// isRealMedia reports whether an item is backed by an actual file rather
+// than being a virtual placeholder (e.g. Jellyseerr's "request this" items,
+// or unaired episodes). Movies and episodes are additionally required to
+// have at least one media source with a path; series roots are exempt since
+// Jellyfin doesn't populate MediaSources for a non-playable folder item.
+func isRealMedia(ri rawItem) bool {
+	if ri.IsVirtualItem {
+		return false
+	}
+	if ri.LocationType != "" && ri.LocationType != "FileSystem" {
+		return false
+	}
+	switch strings.ToLower(ri.Type) {
+	case "movie", "episode":
+		if ri.Path == "" || len(ri.MediaSources) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 var nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
@@ -226,7 +260,7 @@ func (c *Client) ListItems(ctx context.Context) ([]CatalogItem, error) {
 	req, err := c.NewRequest(ctx, http.MethodGet, "/Items", url.Values{
 		"Recursive":        {"true"},
 		"IncludeItemTypes": {"Movie,Episode,Series"},
-		"Fields":           {"Path,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,ProviderIds"},
+		"Fields":           {"Path,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,ProviderIds,MediaSources"},
 	})
 	if err != nil {
 		return nil, err
@@ -256,7 +290,7 @@ func (c *Client) ListItems(ctx context.Context) ([]CatalogItem, error) {
 func buildCatalogItems(raw []rawItem) []CatalogItem {
 	seriesGlobalIDs := make(map[string]string, len(raw)) // local SeriesId -> GlobalID
 	for _, ri := range raw {
-		if strings.ToLower(ri.Type) != "series" {
+		if strings.ToLower(ri.Type) != "series" || !isRealMedia(ri) {
 			continue
 		}
 		seriesGlobalIDs[ri.Id] = CatalogItem{
@@ -271,6 +305,9 @@ func buildCatalogItems(raw []rawItem) []CatalogItem {
 
 	items := make([]CatalogItem, 0, len(raw))
 	for _, ri := range raw {
+		if !isRealMedia(ri) {
+			continue
+		}
 		item := CatalogItem{
 			ItemID:    ri.Id,
 			Name:      ri.Name,

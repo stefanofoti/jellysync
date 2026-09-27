@@ -20,15 +20,19 @@ func TestBuildCatalogItemsJoinsSeries(t *testing.T) {
 			Id:                "ep-1",
 			Name:              "Pilot",
 			Type:              "Episode",
+			Path:              "/media/show/s01e01.mkv",
 			SeriesId:          "series-1",
 			SeriesName:        "Test Show",
 			ParentIndexNumber: 1,
 			IndexNumber:       1,
+			MediaSources:      []rawMediaSource{{Path: "/media/show/s01e01.mkv"}},
 		},
 		{
-			Id:   "movie-1",
-			Name: "Test Movie",
-			Type: "Movie",
+			Id:           "movie-1",
+			Name:         "Test Movie",
+			Type:         "Movie",
+			Path:         "/media/movie.mkv",
+			MediaSources: []rawMediaSource{{Path: "/media/movie.mkv"}},
 		},
 	}
 
@@ -69,19 +73,59 @@ func TestBuildCatalogItemsJoinsSeries(t *testing.T) {
 }
 
 func TestEpisodeHashAvoidsCrossSeriesCollision(t *testing.T) {
+	episode := func(id, seriesID string) rawItem {
+		return rawItem{
+			Id: id, Name: "Pilot", Type: "Episode", Path: "/media/" + id + ".mkv",
+			SeriesId: seriesID, ParentIndexNumber: 1, IndexNumber: 1,
+			MediaSources: []rawMediaSource{{Path: "/media/" + id + ".mkv"}},
+		}
+	}
 	a := buildCatalogItems([]rawItem{
 		{Id: "s1", Name: "Show A", Type: "Series"},
-		{Id: "e1", Name: "Pilot", Type: "Episode", SeriesId: "s1", ParentIndexNumber: 1, IndexNumber: 1},
+		episode("e1", "s1"),
 	})
 	b := buildCatalogItems([]rawItem{
 		{Id: "s2", Name: "Show B", Type: "Series"},
-		{Id: "e2", Name: "Pilot", Type: "Episode", SeriesId: "s2", ParentIndexNumber: 1, IndexNumber: 1},
+		episode("e2", "s2"),
 	})
 
 	epA := a[1]
 	epB := b[1]
 	if epA.GlobalID() == epB.GlobalID() {
 		t.Errorf("episodes from different series with no provider IDs collided on GlobalID %q", epA.GlobalID())
+	}
+}
+
+func TestBuildCatalogItemsExcludesVirtualItems(t *testing.T) {
+	raw := []rawItem{
+		{
+			// Jellyseerr's "request this" placeholder: no backing file.
+			Id: "virtual-1", Name: "Some Unreleased Movie", Type: "Movie",
+			IsVirtualItem: true,
+		},
+		{
+			// LocationType "Virtual" with no Path/MediaSources either.
+			Id: "virtual-2", Name: "Another Placeholder", Type: "Movie",
+			LocationType: "Virtual",
+		},
+		{
+			// FileSystem-located but missing MediaSources (e.g. a broken scan).
+			Id: "no-source", Name: "Missing Source", Type: "Movie",
+			Path: "/media/missing.mkv", LocationType: "FileSystem",
+		},
+		{
+			Id: "real-movie", Name: "Real Movie", Type: "Movie",
+			Path: "/media/real.mkv", LocationType: "FileSystem",
+			MediaSources: []rawMediaSource{{Path: "/media/real.mkv"}},
+		},
+	}
+
+	items := buildCatalogItems(raw)
+	if len(items) != 1 {
+		t.Fatalf("got %d items, want 1: %+v", len(items), items)
+	}
+	if items[0].ItemID != "real-movie" {
+		t.Errorf("surviving item = %q, want %q", items[0].ItemID, "real-movie")
 	}
 }
 
