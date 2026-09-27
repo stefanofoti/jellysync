@@ -49,12 +49,26 @@ type catalogResponse struct {
 }
 
 // LocalEntries builds the wire-format catalog for this node's own library,
-// excluding any item whose file lives under strmDir. Those are jellysync's
-// own generated .strm redirects, not real local media — Jellyfin can't
-// tell the two apart in its /Items listing (both just look like a
-// FileSystem-located item), so without this exclusion a node would "find"
-// its own remote-elected item on the next sync, mark it local, and delete
-// the very .strm it just wrote, in an endless loop.
+// excluding any item that's actually one of jellysync's own generated .strm
+// redirects rather than real local media — Jellyfin can't tell the two
+// apart in its /Items listing (both just look like a FileSystem-located
+// item), so without this exclusion a node would "find" its own
+// remote-elected item on the next sync, mark it local, and delete the very
+// .strm it just wrote, in an endless loop.
+//
+// Two independent checks catch this, since either alone is fragile:
+//   - path-prefix: the item's file lives under strmDir. This only matches
+//     when Jellyfin and jellysync agree on that directory's absolute path,
+//     which breaks silently if they mount the shared folder differently
+//     (e.g. two separate containers with different bind-mount targets, or
+//     a symlink one side resolves and the other doesn't) — the item then
+//     slips through as if it were real local media.
+//   - extension: every file jellysync writes ends in ".strm" (see
+//     internal/strm), and real local media never does. This holds
+//     regardless of how the two sides mount the directory, so it's the
+//     more robust of the two — kept alongside the path check rather than
+//     replacing it, in case a user's library legitimately contains
+//     unrelated .strm files from another tool.
 func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]Entry, error) {
 	items, err := jf.ListItems(ctx)
 	if err != nil {
@@ -65,6 +79,9 @@ func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]E
 	entries := make([]Entry, 0, len(items))
 	for _, it := range items {
 		if strmDir != "" && strings.HasPrefix(filepath.Clean(it.Path)+string(filepath.Separator), cleanStrmDir) {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(it.Path), ".strm") {
 			continue
 		}
 		entries = append(entries, Entry{
