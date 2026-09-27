@@ -199,7 +199,7 @@
     ),
   );
 
-  let trafficPeerIds = $derived(Object.keys(traffic).sort());
+  let trafficPeerIds = $derived(Object.keys(traffic).sort((a, b) => peerLabel(a).localeCompare(peerLabel(b))));
 
   // "local" first, then every configured peer — the fixed set of rows the
   // settings modal shows a sync status bar for.
@@ -216,6 +216,26 @@
     const h = 40;
     const step = history.length > 1 ? w / (history.length - 1) : 0;
     return values.map((v, i) => `${(i * step).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`).join(" ");
+  }
+
+  // Owner/peer keys everywhere in the API ("local", a peer's registry id,
+  // or — for traffic from a caller we couldn't match — a raw node id or
+  // "unknown") mapped to what the dashboard should show instead.
+  let peersById = $derived(new Map(peers.map((p) => [p.id, p])));
+
+  function peerLabel(id) {
+    if (id === "local") return "local";
+    const peer = peersById.get(id);
+    if (peer) return peer.name || shortId(peer.id);
+    return id;
+  }
+
+  function peerIp(id) {
+    return peersById.get(id)?.ip ?? "";
+  }
+
+  function shortId(id) {
+    return id.length > 8 ? `${id.slice(0, 8)}…` : id;
   }
 
   function stateColor(state) {
@@ -336,7 +356,7 @@
         if (!episode.local && episode.primary_peer_id) set.add(episode.primary_peer_id);
       }
     }
-    return [...set].sort((a, b) => (a === "local" ? -1 : b === "local" ? 1 : a.localeCompare(b)));
+    return [...set].sort((a, b) => (a === "local" ? -1 : b === "local" ? 1 : peerLabel(a).localeCompare(peerLabel(b))));
   });
 
   function syncFilterSources() {
@@ -431,13 +451,13 @@
   });
 </script>
 
-<div class="min-h-screen bg-neutral-950 text-neutral-200 p-6 font-sans">
-  <div class="max-w-4xl mx-auto space-y-6">
-    <header class="flex items-baseline justify-between">
+<div class="min-h-screen bg-neutral-950 text-neutral-200 px-3 py-4 sm:p-6 font-sans overflow-x-hidden">
+  <div class="max-w-4xl mx-auto space-y-4 sm:space-y-6">
+    <header class="flex flex-wrap items-center justify-between gap-2">
       <h1 class="text-xl font-semibold text-neutral-100">jellysync</h1>
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 min-w-0">
         {#if health}
-          <span class="text-sm text-neutral-500">
+          <span class="text-xs sm:text-sm text-neutral-500">
             node <span class="text-neutral-300">{health.node_id}</span>
             · <span class="font-mono text-neutral-400">v{health.version}</span>
             · up {health.uptime_seconds}s
@@ -453,11 +473,11 @@
     </header>
 
     {#if error}
-      <div class="rounded border border-red-800 bg-red-950/50 text-red-300 text-sm px-3 py-2">{error}</div>
+      <div class="rounded border border-red-800 bg-red-950/50 text-red-300 text-sm px-3 py-2 break-words">{error}</div>
     {/if}
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-      <section class="rounded border border-neutral-800 bg-neutral-900/50">
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
+      <section class="rounded border border-neutral-800 bg-neutral-900/50 min-w-0">
         <h2 class="text-sm font-medium text-neutral-400 px-4 py-3 border-b border-neutral-800">Library</h2>
         <table class="w-full text-sm">
           <thead>
@@ -471,7 +491,7 @@
           <tbody>
             {#each stats as s (s.owner)}
               <tr class="border-b border-neutral-800/60 last:border-0">
-                <td class="px-4 py-2 font-mono">{s.owner}</td>
+                <td class="px-4 py-2 break-all">{peerLabel(s.owner)}</td>
                 <td class="px-4 py-2">{s.movies}</td>
                 <td class="px-4 py-2">{s.series}</td>
                 <td class="px-4 py-2">{s.episodes}</td>
@@ -483,7 +503,7 @@
           {#if stats.length > 0}
             <tfoot>
               <tr class="border-t border-neutral-800 font-medium text-neutral-200">
-                <td class="px-4 py-2 font-mono">total</td>
+                <td class="px-4 py-2">total</td>
                 <td class="px-4 py-2">{libraryTotal.movies}</td>
                 <td class="px-4 py-2">{libraryTotal.series}</td>
                 <td class="px-4 py-2">{libraryTotal.episodes}</td>
@@ -493,47 +513,55 @@
         </table>
       </section>
 
-      <section class="rounded border border-neutral-800 bg-neutral-900/50">
+      <section class="rounded border border-neutral-800 bg-neutral-900/50 min-w-0">
         <h2 class="text-sm font-medium text-neutral-400 px-4 py-3 border-b border-neutral-800">Peers</h2>
         <table class="w-full text-sm">
           <tbody>
             {#each peers as peer (peer.id)}
               <tr class="border-b border-neutral-800/60 last:border-0">
-                <td class="px-4 py-2">
-                  <div>{peer.name || "(unnamed)"}</div>
-                  <div class="text-neutral-600 font-mono text-xs">{peer.id}</div>
+                <td class="px-4 py-2 min-w-0 max-w-0 w-full">
+                  <div class="truncate">{peer.name || "(unnamed)"}</div>
+                  <div class="text-neutral-500 font-mono text-xs truncate" title={peer.url}>
+                    {peer.ip || "IP unknown"}<span class="text-neutral-600">&nbsp;· {peer.url}</span>
+                  </div>
                 </td>
-                <td class="px-4 py-2 text-neutral-500 font-mono text-xs truncate max-w-0">{peer.url}</td>
                 <td class="px-4 py-2 text-right">
                   <span class={`rounded px-2 py-0.5 text-xs ${stateColor(peer.state)}`}>{peer.state}</span>
                 </td>
               </tr>
             {:else}
-              <tr><td class="px-4 py-3 text-neutral-500" colspan="3">No peers configured.</td></tr>
+              <tr><td class="px-4 py-3 text-neutral-500" colspan="2">No peers configured.</td></tr>
             {/each}
           </tbody>
         </table>
       </section>
     </div>
 
-    <section class="rounded border border-neutral-800 bg-neutral-900/50">
+    <section class="rounded border border-neutral-800 bg-neutral-900/50 min-w-0">
       <h2 class="text-sm font-medium text-neutral-400 px-4 py-3 border-b border-neutral-800">Traffic</h2>
       <table class="w-full text-sm">
         <tbody>
           {#each trafficPeerIds as peerId (peerId)}
             <tr class="border-b border-neutral-800/60 last:border-0">
-              <td class="px-4 py-2 font-mono align-top">{peerId}</td>
-              <td class="px-4 py-2 align-top">
+              <td class="px-3 sm:px-4 py-2 align-top max-w-0 w-full">
+                <div class="truncate" title={peerId}>{peerLabel(peerId)}</div>
+                {#if peerIp(peerId)}
+                  <div class="text-neutral-600 font-mono text-xs truncate">{peerIp(peerId)}</div>
+                {:else if !peersById.has(peerId)}
+                  <div class="text-neutral-600 text-xs">not a configured peer</div>
+                {/if}
+              </td>
+              <td class="px-3 sm:px-4 py-2 align-top whitespace-nowrap">
                 <div class="text-neutral-500 text-xs">in</div>
                 <div>{formatBitrate(traffic[peerId].current_in_bps)}</div>
                 <div class="text-neutral-600 text-xs">{formatBytes(traffic[peerId].total_in_bytes)} total</div>
               </td>
-              <td class="px-4 py-2 align-top">
+              <td class="px-3 sm:px-4 py-2 align-top whitespace-nowrap">
                 <div class="text-neutral-500 text-xs">out</div>
                 <div>{formatBitrate(traffic[peerId].current_out_bps)}</div>
                 <div class="text-neutral-600 text-xs">{formatBytes(traffic[peerId].total_out_bytes)} total</div>
               </td>
-              <td class="px-4 py-2 align-top">
+              <td class="px-4 py-2 align-top hidden sm:table-cell">
                 <svg viewBox="0 0 200 40" class="w-40 h-10">
                   <polyline
                     points={sparklinePoints(traffic[peerId].history, "in_bps")}
@@ -557,8 +585,8 @@
       </table>
     </section>
 
-    <section class="rounded border border-neutral-800 bg-neutral-900/50">
-      <div class="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
+    <section class="rounded border border-neutral-800 bg-neutral-900/50 min-w-0">
+      <div class="flex items-center justify-between gap-2 px-3 sm:px-4 py-3 border-b border-neutral-800">
         <div class="flex items-center gap-1">
           <button
             class={`rounded px-3 py-1 text-sm ${activeTab === "movies" ? "bg-neutral-700 text-neutral-100" : "text-neutral-500 hover:text-neutral-300"}`}
@@ -582,11 +610,16 @@
             Sources ({enabledPeers.size}/{filterSources.length}) ▾
           </button>
           {#if filterOpen}
-            <div class="absolute right-0 mt-1 w-48 rounded border border-neutral-700 bg-neutral-900 shadow-lg z-10 py-1">
+            <div class="absolute right-0 mt-1 w-56 max-w-[calc(100vw-2rem)] rounded border border-neutral-700 bg-neutral-900 shadow-lg z-10 py-1">
               {#each filterSources as id (id)}
                 <label class="flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-neutral-800 cursor-pointer">
                   <input type="checkbox" checked={enabledPeers.has(id)} onchange={() => toggleFilterSource(id)} />
-                  <span class="font-mono">{id === "local" ? "local" : id}</span>
+                  <span class="min-w-0">
+                    <span class="block truncate">{peerLabel(id)}</span>
+                    {#if peerIp(id)}
+                      <span class="block text-neutral-600 font-mono text-xs truncate">{peerIp(id)}</span>
+                    {/if}
+                  </span>
                 </label>
               {/each}
             </div>
@@ -594,19 +627,20 @@
         </div>
       </div>
 
+      <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <tbody>
           {#if activeTab === "movies"}
             {#each movieRows as row (row.key)}
               <tr class="border-b border-neutral-800/60 last:border-0">
-                <td class="px-4 py-2">{row.item.name}</td>
-                <td class="px-4 py-2 text-neutral-500">movie</td>
+                <td class="px-3 sm:px-4 py-2 break-words">{row.item.name}</td>
+                <td class="px-4 py-2 text-neutral-500 hidden sm:table-cell">movie</td>
                 <td class="px-4 py-2">
                   {#if row.item.local}
                     <span class="rounded px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400">local</span>
                   {:else}
-                    <span class="rounded px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400">
-                      remote · {row.item.primary_peer_id}
+                    <span class="inline-block max-w-[10rem] truncate align-middle whitespace-nowrap rounded px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400">
+                      remote · {peerLabel(row.item.primary_peer_id)}
                     </span>
                   {/if}
                 </td>
@@ -643,16 +677,16 @@
                 class="border-b border-neutral-800/60 last:border-0 cursor-pointer hover:bg-neutral-800/40"
                 onclick={() => toggleSeries(row.key)}
               >
-                <td class="px-4 py-2">
+                <td class="px-3 sm:px-4 py-2 break-words">
                   <span class="inline-block w-4 text-neutral-500">{expandedSeries.has(row.key) ? "▾" : "▸"}</span>
                   {row.name}
                 </td>
-                <td class="px-4 py-2 text-neutral-500">series</td>
+                <td class="px-4 py-2 text-neutral-500 hidden sm:table-cell">series</td>
                 <td class="px-4 py-2">
                   {#if row.localCount === row.totalCount}
                     <span class="rounded px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400">local</span>
                   {:else if row.localCount === 0}
-                    <span class="rounded px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400">remote</span>
+                    <span class="inline-block max-w-[10rem] truncate align-middle whitespace-nowrap rounded px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400">remote</span>
                   {:else}
                     <span class="rounded px-2 py-0.5 text-xs bg-neutral-700 text-neutral-300">mixed</span>
                   {/if}
@@ -677,14 +711,14 @@
                   </tr>
                   {#each season.episodes as episode (episode.global_id)}
                     <tr class="border-b border-neutral-800/60 last:border-0">
-                      <td class="px-4 py-2 pl-14 text-neutral-300">{episodeLabel(episode)}</td>
-                      <td class="px-4 py-2 text-neutral-500">episode</td>
+                      <td class="px-3 sm:px-4 py-2 pl-8 sm:pl-14 text-neutral-300 break-words">{episodeLabel(episode)}</td>
+                      <td class="px-4 py-2 text-neutral-500 hidden sm:table-cell">episode</td>
                       <td class="px-4 py-2">
                         {#if episode.local}
                           <span class="rounded px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400">local</span>
                         {:else}
-                          <span class="rounded px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400">
-                            remote · {episode.primary_peer_id}
+                          <span class="inline-block max-w-[10rem] truncate align-middle whitespace-nowrap rounded px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400">
+                            remote · {peerLabel(episode.primary_peer_id)}
                           </span>
                         {/if}
                       </td>
@@ -721,10 +755,11 @@
           {/if}
         </tbody>
       </table>
+      </div>
 
       {#if activeTab === "movies"}
         {@const p = pagerInfo(moviePage)}
-        <div class="flex items-center justify-between px-4 py-2 border-t border-neutral-800 text-xs text-neutral-500">
+        <div class="flex items-center justify-between gap-2 px-3 sm:px-4 py-2 border-t border-neutral-800 text-xs text-neutral-500">
           <span>{p.from}–{p.to} of {moviePage.total} movies</span>
           <div class="flex gap-2">
             <button
@@ -745,7 +780,7 @@
         </div>
       {:else}
         {@const p = pagerInfo(seriesPage)}
-        <div class="flex items-center justify-between px-4 py-2 border-t border-neutral-800 text-xs text-neutral-500">
+        <div class="flex items-center justify-between gap-2 px-3 sm:px-4 py-2 border-t border-neutral-800 text-xs text-neutral-500">
           <span>{p.from}–{p.to} of {seriesPage.total} series</span>
           <div class="flex gap-2">
             <button
@@ -772,10 +807,10 @@
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
-      class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+      class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-2 sm:p-4"
       onclick={(e) => { if (e.target === e.currentTarget) settingsOpen = false; }}
     >
-      <div class="w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded border border-neutral-700 bg-neutral-900 shadow-lg">
+      <div class="w-full max-w-2xl max-h-[90vh] overflow-y-auto overflow-x-hidden rounded border border-neutral-700 bg-neutral-900 shadow-lg">
         <div class="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
           <h2 class="text-sm font-medium text-neutral-200">Settings</h2>
           <button class="text-neutral-500 hover:text-neutral-200 text-sm" onclick={() => (settingsOpen = false)}>
@@ -785,7 +820,7 @@
 
         <div class="px-4 py-4 space-y-3 border-b border-neutral-800">
           <h3 class="text-xs font-medium text-neutral-500 uppercase">Sync now</h3>
-          <div class="flex gap-2">
+          <div class="flex flex-wrap gap-2">
             <button
               class="rounded bg-neutral-700 hover:bg-neutral-600 disabled:opacity-50 px-3 py-1 text-sm"
               disabled={triggering.has("local")}
@@ -813,8 +848,8 @@
             {#each syncTargets as target (target.id)}
               {@const status = syncStatus[target.id] ?? { state: "idle", percent: 0 }}
               <div class="text-sm">
-                <div class="flex items-center justify-between mb-1">
-                  <span class="font-mono">{target.id}</span>
+                <div class="flex items-center justify-between gap-2 mb-1">
+                  <span class="truncate">{peerLabel(target.id)}</span>
                   <span class={`rounded px-2 py-0.5 text-xs ${syncStateColor(status.state)}`}>{status.state}</span>
                 </div>
                 <div class="h-1.5 rounded bg-neutral-800 overflow-hidden">
@@ -824,7 +859,7 @@
                   ></div>
                 </div>
                 {#if status.error}
-                  <div class="text-xs text-red-400 mt-1">{status.error}</div>
+                  <div class="text-xs text-red-400 mt-1 break-words">{status.error}</div>
                 {/if}
               </div>
             {/each}
@@ -837,16 +872,18 @@
             <tbody>
               {#each peers as peer (peer.id)}
                 <tr class="border-b border-neutral-800/60 last:border-0">
-                  <td class="px-2 py-2">
-                    <div>{peer.name || "(unnamed)"}</div>
-                    <div class="text-neutral-600 font-mono text-xs">{peer.id}</div>
+                  <td class="px-2 py-2 max-w-0 w-full">
+                    <div class="truncate">{peer.name || "(unnamed)"}</div>
+                    <div class="text-neutral-500 font-mono text-xs truncate" title={peer.url}>{peer.url}</div>
+                    <div class="text-neutral-600 font-mono text-xs truncate">
+                      {peer.ip || "IP unknown"} · {peer.version ? `v${peer.version}` : "version unknown"}
+                    </div>
+                    <div class="text-neutral-700 font-mono text-xs truncate" title={peer.id}>{peer.id}</div>
                   </td>
-                  <td class="px-2 py-2 text-neutral-500 font-mono">{peer.url}</td>
-                  <td class="px-2 py-2">
+                  <td class="px-2 py-2 align-top">
                     <span class={`rounded px-2 py-0.5 text-xs ${stateColor(peer.state)}`}>{peer.state}</span>
                   </td>
-                  <td class="px-2 py-2 text-neutral-500 font-mono text-xs">{peer.version ? `v${peer.version}` : "—"}</td>
-                  <td class="px-2 py-2 text-right">
+                  <td class="px-2 py-2 text-right align-top">
                     <button
                       class="text-neutral-500 hover:text-red-400 text-xs"
                       onclick={() => removePeer(peer.id)}
@@ -856,7 +893,7 @@
                   </td>
                 </tr>
               {:else}
-                <tr><td class="px-2 py-3 text-neutral-500" colspan="5">No peers configured.</td></tr>
+                <tr><td class="px-2 py-3 text-neutral-500" colspan="3">No peers configured.</td></tr>
               {/each}
             </tbody>
           </table>
@@ -865,7 +902,7 @@
             onsubmit={(e) => { e.preventDefault(); addPeer(); }}
           >
             <input
-              class="flex-1 rounded bg-neutral-800 border border-neutral-700 px-2 py-1 text-sm font-mono"
+              class="flex-1 min-w-0 rounded bg-neutral-800 border border-neutral-700 px-2 py-1 text-sm font-mono"
               placeholder="http://peer-host:8080"
               bind:value={newPeerUrl}
             />

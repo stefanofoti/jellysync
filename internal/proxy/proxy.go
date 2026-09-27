@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
@@ -58,10 +59,7 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 		if peerID == "local" {
 			upstream, err = jf.NewDownloadRequest(r.Context(), itemID)
 			trafficDir = metrics.Out
-			trafficPeer = r.Header.Get(peerHeader)
-			if trafficPeer == "" {
-				trafficPeer = "unknown"
-			}
+			trafficPeer = callerPeerID(registry, r)
 		} else if p, found := registry.Get(peerID); found {
 			upstream, err = http.NewRequestWithContext(r.Context(), http.MethodGet,
 				p.URL+"/api/v1/proxy/stream/local/"+itemID, nil)
@@ -118,4 +116,25 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 			log.Printf("proxy: peer=%s item=%s: copy: %v", peerID, itemID, err)
 		}
 	}
+}
+
+// callerPeerID attributes a "local" stream request to the registry id of
+// the peer that made it. The header carries the caller's own NODE_ID, which
+// is our peer's Name, not the id we assigned it — recording the raw header
+// value would split one peer's traffic across two keys (incoming under its
+// id, outgoing under its name). Falls back to matching the source IP, then
+// to the raw header value, then "unknown".
+func callerPeerID(registry *peers.Registry, r *http.Request) string {
+	nodeID := r.Header.Get(peerHeader)
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteIP = r.RemoteAddr
+	}
+	if id := registry.ResolveCaller(nodeID, remoteIP); id != "" {
+		return id
+	}
+	if nodeID != "" {
+		return nodeID
+	}
+	return "unknown"
 }

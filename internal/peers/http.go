@@ -16,6 +16,7 @@ type peerDTO struct {
 	URL     string `json:"url"`
 	State   string `json:"state"`
 	Version string `json:"version,omitempty"`
+	IP      string `json:"ip,omitempty"`
 }
 
 // ListHandler serves GET /api/v1/peers.
@@ -24,7 +25,7 @@ func ListHandler(registry *Registry) http.HandlerFunc {
 		list := registry.List()
 		out := make([]peerDTO, 0, len(list))
 		for _, p := range list {
-			out = append(out, peerDTO{ID: p.ID, Name: p.Name, URL: p.URL, State: string(p.State), Version: p.Version})
+			out = append(out, peerDTO{ID: p.ID, Name: p.Name, URL: p.URL, State: string(p.State), Version: p.Version, IP: p.IP})
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(out)

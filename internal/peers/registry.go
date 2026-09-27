@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,7 @@ type Peer struct {
 	State   State
 	Name    string // last-known /health "node_id" reported by this peer; display label only, "" until first successful probe
 	Version string // last-known /health "version" reported by this peer; "" until first successful probe
+	IP      string // last-known IP address of URL's host; display label and caller-attribution fallback only, "" until resolved
 
 	missed int
 }
@@ -89,6 +92,7 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Re
 			return nil, fmt.Errorf("scanning peer: %w", err)
 		}
 		p.State = State(state)
+		p.IP = literalIP(p.URL)
 		r.peers[p.ID] = &p
 	}
 	if err := rows.Err(); err != nil {
@@ -145,7 +149,7 @@ func (r *Registry) AddPeer(ctx context.Context, id, url, name, version string) e
 	}
 
 	r.mu.Lock()
-	r.peers[id] = &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version}
+	r.peers[id] = &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version, IP: resolveIP(ctx, url)}
 	r.mu.Unlock()
 
 	r.startHeartbeat(id)
@@ -179,6 +183,31 @@ func (r *Registry) List() []Peer {
 		out = append(out, *p)
 	}
 	return out
+}
+
+// ResolveCaller maps an incoming peer request to this node's registry id
+// for that peer. nodeID is the caller's self-reported NODE_ID (which is the
+// Name we learned from its /health, not the id we assigned it), remoteIP is
+// the request's source address. Name wins; the IP match covers callers too
+// old to send their node id. Returns "" if neither matches a known peer.
+func (r *Registry) ResolveCaller(nodeID, remoteIP string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if nodeID != "" {
+		for id, p := range r.peers {
+			if p.Name == nodeID || id == nodeID {
+				return id
+			}
+		}
+	}
+	if remoteIP != "" {
+		for id, p := range r.peers {
+			if p.IP != "" && p.IP == remoteIP {
+				return id
+			}
+		}
+	}
+	return ""
 }
 
 func (r *Registry) Get(id string) (Peer, bool) {
@@ -257,6 +286,7 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 
 	name, version, probeErr := r.Probe(ctx, url)
 	healthy := probeErr == nil
+	ip := resolveIP(ctx, url)
 
 	r.mu.Lock()
 	p, ok = r.peers[id]
@@ -265,6 +295,9 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 		return
 	}
 	prevState := p.State
+	if ip != "" {
+		p.IP = ip
+	}
 	if healthy {
 		p.missed = 0
 		p.State = StateOnline
@@ -305,4 +338,41 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	if execErr != nil {
 		log.Printf("peer %s: failed to persist state: %v", id, execErr)
 	}
+}
+
+// literalIP returns rawURL's host if it's already an IP address, else "".
+// Needs no network round trip, so it's safe to call at load time.
+func literalIP(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
+// resolveIP returns the IP address rawURL's host resolves to, preferring
+// IPv4, or "" if it can't be resolved within heartbeatTimeout.
+func resolveIP(ctx context.Context, rawURL string) string {
+	if ip := literalIP(rawURL); ip != "" {
+		return ip
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, u.Hostname())
+	if err != nil || len(addrs) == 0 {
+		return ""
+	}
+	for _, a := range addrs {
+		if v4 := a.IP.To4(); v4 != nil {
+			return v4.String()
+		}
+	}
+	return addrs[0].IP.String()
 }
