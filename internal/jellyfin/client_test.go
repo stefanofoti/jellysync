@@ -25,14 +25,12 @@ func TestBuildCatalogItemsJoinsSeries(t *testing.T) {
 			SeriesName:        "Test Show",
 			ParentIndexNumber: 1,
 			IndexNumber:       1,
-			MediaSources:      []rawMediaSource{{Path: "/media/show/s01e01.mkv"}},
 		},
 		{
-			Id:           "movie-1",
-			Name:         "Test Movie",
-			Type:         "Movie",
-			Path:         "/media/movie.mkv",
-			MediaSources: []rawMediaSource{{Path: "/media/movie.mkv"}},
+			Id:   "movie-1",
+			Name: "Test Movie",
+			Type: "Movie",
+			Path: "/media/movie.mkv",
 		},
 	}
 
@@ -77,7 +75,6 @@ func TestEpisodeHashAvoidsCrossSeriesCollision(t *testing.T) {
 		return rawItem{
 			Id: id, Name: "Pilot", Type: "Episode", Path: "/media/" + id + ".mkv",
 			SeriesId: seriesID, ParentIndexNumber: 1, IndexNumber: 1,
-			MediaSources: []rawMediaSource{{Path: "/media/" + id + ".mkv"}},
 		}
 	}
 	a := buildCatalogItems([]rawItem{
@@ -104,19 +101,19 @@ func TestBuildCatalogItemsExcludesVirtualItems(t *testing.T) {
 			IsVirtualItem: true,
 		},
 		{
-			// LocationType "Virtual" with no Path/MediaSources either.
+			// LocationType "Virtual" with no Path either.
 			Id: "virtual-2", Name: "Another Placeholder", Type: "Movie",
 			LocationType: "Virtual",
 		},
 		{
-			// FileSystem-located but missing MediaSources (e.g. a broken scan).
-			Id: "no-source", Name: "Missing Source", Type: "Movie",
-			Path: "/media/missing.mkv", LocationType: "FileSystem",
+			// No Path at all (e.g. an item Jellyfin hasn't finished
+			// importing): still excluded, since isRealMedia requires one
+			// for movies/episodes regardless of LocationType.
+			Id: "no-path", Name: "Missing Path", Type: "Movie",
 		},
 		{
 			Id: "real-movie", Name: "Real Movie", Type: "Movie",
 			Path: "/media/real.mkv", LocationType: "FileSystem",
-			MediaSources: []rawMediaSource{{Path: "/media/real.mkv"}},
 		},
 	}
 

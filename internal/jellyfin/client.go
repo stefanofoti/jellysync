@@ -195,25 +195,26 @@ type rawItem struct {
 	ParentIndexNumber int               `json:"ParentIndexNumber"`
 	IndexNumber       int               `json:"IndexNumber"`
 
-	// LocationType/IsVirtualItem/MediaSources exist to filter out
-	// placeholder items injected by plugins like Jellyseerr's "request"
-	// integration (e.g. a fake "favorite this to request it" movie). Those
-	// have no backing file, so treating them as real media would produce a
-	// .strm that can never stream. See isRealMedia.
-	LocationType  string           `json:"LocationType"`
-	IsVirtualItem bool             `json:"IsVirtualItem"`
-	MediaSources  []rawMediaSource `json:"MediaSources"`
-}
-
-type rawMediaSource struct {
-	Path string `json:"Path"`
+	// LocationType/IsVirtualItem exist to filter out placeholder items
+	// injected by plugins like Jellyseerr's "request" integration (e.g. a
+	// fake "favorite this to request it" movie). Those have no backing
+	// file, so treating them as real media would produce a .strm that can
+	// never stream. See isRealMedia.
+	LocationType  string `json:"LocationType"`
+	IsVirtualItem bool   `json:"IsVirtualItem"`
 }
 
 // isRealMedia reports whether an item is backed by an actual file rather
 // than being a virtual placeholder (e.g. Jellyseerr's "request this" items,
 // or unaired episodes). Movies and episodes are additionally required to
-// have at least one media source with a path; series roots are exempt since
-// Jellyfin doesn't populate MediaSources for a non-playable folder item.
+// have a Path; series roots are exempt since they're folders, not files.
+//
+// This deliberately doesn't also check Jellyfin's MediaSources field: that
+// would catch a narrower case (a FileSystem-located item Jellyfin hasn't
+// finished probing yet), but asking Jellyfin for MediaSources on every item
+// in a recursive listing is dramatically more expensive than the fields
+// here, which are plain columns Jellyfin already has indexed — and this
+// runs on every sync cycle, not just occasionally.
 func isRealMedia(ri rawItem) bool {
 	if ri.IsVirtualItem {
 		return false
@@ -223,7 +224,7 @@ func isRealMedia(ri rawItem) bool {
 	}
 	switch strings.ToLower(ri.Type) {
 	case "movie", "episode":
-		if ri.Path == "" || len(ri.MediaSources) == 0 {
+		if ri.Path == "" {
 			return false
 		}
 	}
@@ -260,7 +261,7 @@ func (c *Client) ListItems(ctx context.Context) ([]CatalogItem, error) {
 	req, err := c.NewRequest(ctx, http.MethodGet, "/Items", url.Values{
 		"Recursive":        {"true"},
 		"IncludeItemTypes": {"Movie,Episode,Series"},
-		"Fields":           {"Path,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,ProviderIds,MediaSources"},
+		"Fields":           {"Path,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,ProviderIds"},
 	})
 	if err != nil {
 		return nil, err

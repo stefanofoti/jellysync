@@ -15,12 +15,11 @@ import (
 const defaultStreamBufferKB = 256
 
 // defaultJellyfinTimeoutSec bounds every individual request this node makes
-// to its own local Jellyfin, including catalog.Sync's /Items listing —
-// Recursive over the whole library with the MediaSources field is the
-// slowest of these, and can take well over a minute on constrained
-// hardware. That query runs every sync cycle regardless; this is generous
-// headroom for it (plus, on an explicit "force" sync-now, the rescan this
-// node triggers beforehand can leave Jellyfin answering even slower).
+// to its own local Jellyfin, including catalog.Sync's recursive /Items
+// listing, which runs every sync cycle and is the slowest of these on a
+// large library or constrained hardware. Generous rather than tight: on an
+// explicit "force" sync-now, the rescan this node triggers beforehand can
+// also leave Jellyfin answering slower than usual.
 const defaultJellyfinTimeoutSec = 240
 
 // defaultPeerFetchTimeoutSec bounds how long this node waits for a peer's
