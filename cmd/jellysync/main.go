@@ -42,7 +42,7 @@ func main() {
 	}
 	defer store.Close()
 
-	jf := jellyfin.New(cfg.Jellyfin.URL, cfg.Jellyfin.APIKey, cfg.NodeID)
+	jf := jellyfin.New(cfg.Jellyfin.URL, cfg.Jellyfin.APIKey, cfg.NodeID, cfg.JellyfinTimeout)
 	pingCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := jf.Ping(pingCtx); err != nil {

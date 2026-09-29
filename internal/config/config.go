@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // defaultStreamBufferKB is the read/write buffer size used to relay
@@ -12,6 +13,13 @@ import (
 // network sockets, so Go can't use sendfile/splice — a bigger buffer means
 // fewer, larger syscalls per second for a given bitrate.
 const defaultStreamBufferKB = 256
+
+// defaultJellyfinTimeoutSec bounds every request this node makes to its own
+// local Jellyfin, including catalog.Sync's /Items listing — Recursive over
+// the whole library with the MediaSources field is the slowest of these and
+// can exceed the default on a large library, especially right after
+// syncrun triggers a full library rescan.
+const defaultJellyfinTimeoutSec = 60
 
 type Config struct {
 	NodeID     string
@@ -22,6 +30,8 @@ type Config struct {
 	Peers      []Peer
 	// StreamBufferKB is the proxy relay's copy buffer size, in KiB.
 	StreamBufferKB int
+	// JellyfinTimeout bounds every request to the local Jellyfin instance.
+	JellyfinTimeout time.Duration
 }
 
 type Jellyfin struct {
@@ -74,6 +84,15 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("STREAM_BUFFER_KB must be positive, got %d", streamBufferKB)
 	}
 	cfg.StreamBufferKB = streamBufferKB
+
+	jellyfinTimeoutSec, err := envIntOr("JELLYFIN_TIMEOUT_SEC", defaultJellyfinTimeoutSec)
+	if err != nil {
+		return nil, err
+	}
+	if jellyfinTimeoutSec <= 0 {
+		return nil, fmt.Errorf("JELLYFIN_TIMEOUT_SEC must be positive, got %d", jellyfinTimeoutSec)
+	}
+	cfg.JellyfinTimeout = time.Duration(jellyfinTimeoutSec) * time.Second
 
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("NODE_ID is required")

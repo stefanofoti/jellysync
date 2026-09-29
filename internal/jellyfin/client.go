@@ -21,13 +21,13 @@ type Client struct {
 	http    *http.Client
 }
 
-func New(baseURL, apiKey, nodeID string) *Client {
+func New(baseURL, apiKey, nodeID string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		nodeID:  nodeID,
 		http: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }

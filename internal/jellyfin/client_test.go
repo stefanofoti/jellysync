@@ -139,7 +139,7 @@ func TestListItemsIntegration(t *testing.T) {
 		t.Skip("JELLYFIN_TEST_URL / JELLYFIN_TEST_API_KEY not set")
 	}
 
-	c := New(url, apiKey, "test-node")
+	c := New(url, apiKey, "test-node", 15*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
