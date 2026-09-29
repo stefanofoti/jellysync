@@ -4,6 +4,7 @@
 package catalog
 
 import (
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,7 +12,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,10 +20,8 @@ import (
 	"jellysync/internal/peers"
 )
 
-const syncInterval = 60 * time.Second
-
-// httpClient has no Timeout of its own: FetchPeerCatalog's caller bounds
-// each request via the context it passes in instead, so the deadline stays
+// httpClient has no Timeout of its own: callers bound each request via the
+// context they pass in instead, so the deadline stays
 // configurable (see config.PeerFetchTimeout) rather than fixed here.
 var httpClient = &http.Client{}
 
@@ -104,23 +103,124 @@ func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]E
 	return entries, nil
 }
 
-// Handler serves GET /api/v1/catalog with this node's local catalog.
-func Handler(jf *jellyfin.Client, strmDir string) http.HandlerFunc {
+// Handler serves GET /api/v1/catalog, the legacy full-catalog endpoint still
+// used by peers that predate the change feed. It's served from the local
+// index rather than a live Jellyfin listing, so answering it no longer
+// costs this node a full library scan per request.
+func Handler(ix *Index) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// No extra deadline layered on top of r.Context(): LocalEntries
-		// calls jf.ListItems, which is already bounded by the Jellyfin
-		// client's own configurable timeout (config.JellyfinTimeout).
-		entries, err := LocalEntries(r.Context(), jf, strmDir)
+		if err := ix.EnsureIndexed(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		entries, err := ix.Entries(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(catalogResponse{Items: entries})
+		writeJSON(w, r, catalogResponse{Items: entries})
 	}
 }
 
-// FetchPeerCatalog fetches a peer node's catalog over HTTP.
+const (
+	defaultChangesLimit = 1000
+	maxChangesLimit     = 5000
+)
+
+// ChangesHandler serves GET /api/v1/catalog/changes?epoch=E&since=N&limit=L:
+// one page of this node's catalog changes after rev N. A peer that's up to
+// date gets an empty page back, so a routine sync with no library changes
+// costs one tiny request instead of a full catalog transfer. See Feed.
+func ChangesHandler(ix *Index) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		since, err := strconv.ParseInt(q.Get("since"), 10, 64)
+		if err != nil && q.Get("since") != "" {
+			http.Error(w, "invalid since", http.StatusBadRequest)
+			return
+		}
+		limit := defaultChangesLimit
+		if v := q.Get("limit"); v != "" {
+			if limit, err = strconv.Atoi(v); err != nil || limit <= 0 {
+				http.Error(w, "invalid limit", http.StatusBadRequest)
+				return
+			}
+			limit = min(limit, maxChangesLimit)
+		}
+		if err := ix.EnsureIndexed(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		feed, err := ix.Changes(r.Context(), q.Get("epoch"), since, limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, r, feed)
+	}
+}
+
+// NotifyHandler serves POST /api/v1/catalog/notify, a peer's hint that its
+// catalog just changed. wake should schedule a pull-only sync (no local
+// Jellyfin re-read) without blocking; repeated hints are expected to
+// coalesce. The hint carries no data, so trusting it costs at most one
+// cheap, empty change-feed request per peer.
+func NotifyHandler(wake func()) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		wake()
+		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
+// notifyTimeout bounds each best-effort change notification to a peer.
+const notifyTimeout = 5 * time.Second
+
+// NotifyPeers tells every ONLINE peer that this node's catalog changed, so
+// they pull the delta now instead of at their next scheduled sync.
+// Best-effort and fire-and-forget: peers that miss it (or predate the
+// endpoint) still catch up on their own schedule.
+func NotifyPeers(registry *peers.Registry, selfID string) {
+	for _, p := range registry.List() {
+		if p.State != peers.StateOnline {
+			continue
+		}
+		go func(p peers.Peer) {
+			ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.URL+"/api/v1/catalog/notify", nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("X-Jellysync-Peer", selfID)
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				log.Printf("catalog: notifying peer %s: %v", p.ID, err)
+				return
+			}
+			resp.Body.Close()
+		}(p)
+	}
+}
+
+// writeJSON encodes v as the response, gzip-compressed when the client
+// accepts it. Catalog JSON is highly repetitive and compresses ~10x; Go's
+// HTTP client asks for and transparently decodes gzip on its own, so every
+// jellysync peer, old or new, benefits without doing anything.
+func writeJSON(w http.ResponseWriter, r *http.Request, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Add("Vary", "Accept-Encoding")
+	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		json.NewEncoder(w).Encode(v)
+		return
+	}
+	w.Header().Set("Content-Encoding", "gzip")
+	gz := gzip.NewWriter(w)
+	defer gz.Close()
+	json.NewEncoder(gz).Encode(v)
+}
+
+// FetchPeerCatalog fetches a peer node's whole catalog over the legacy
+// GET /api/v1/catalog endpoint, for peers that predate the change feed.
 func FetchPeerCatalog(ctx context.Context, peerURL string) ([]Entry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, peerURL+"/api/v1/catalog", nil)
 	if err != nil {
@@ -142,215 +242,238 @@ func FetchPeerCatalog(ctx context.Context, peerURL string) ([]Entry, error) {
 	return parsed.Items, nil
 }
 
-// Sync fetches the local catalog and every ONLINE peer's catalog, applies
-// the dedup rule, and persists the result to catalog_items:
+// Sync brings catalog_items up to date:
+//  1. if refreshLocal, re-reads the local Jellyfin library into the index
+//     (skipped for a pull-only sync triggered by a peer's notification);
+//  2. pulls every ONLINE peer's changes since the last sync into its local
+//     mirror (peer_catalog), concurrently and page by page;
+//  3. re-runs the election over the index and mirrors and writes only rows
+//     that actually changed, in a single transaction.
+//
+// The election rule is unchanged:
 //   - if an item exists locally, local always wins;
 //   - otherwise the peer with the lexicographically smallest ID among those
 //     offering the item is elected primary. This is a pure function of peer
 //     IDs (no latency/timing involved), which avoids two nodes racing to a
 //     different answer for the same item.
-func Sync(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmDir string, peerFetchTimeout time.Duration) error {
-	local, err := LocalEntries(ctx, jf, strmDir)
-	if err != nil {
-		return fmt.Errorf("local catalog: %w", err)
-	}
-	localByGlobalID := make(map[string]Entry, len(local))
-	for _, e := range local {
-		localByGlobalID[e.GlobalID] = e
-	}
-
-	// global_id -> peer_id -> full offered entry. Keeping the whole Entry
-	// (not just the item ID) means name/media_type below can be read from
-	// whichever peer actually gets elected primary, instead of whichever
-	// peer happened to be processed last in this (unordered) map iteration.
-	remoteOffers := make(map[string]map[string]Entry)
-
-	for _, p := range registry.List() {
-		if p.State != peers.StateOnline {
-			continue
-		}
-		peerCtx, cancel := context.WithTimeout(ctx, peerFetchTimeout)
-		entries, err := FetchPeerCatalog(peerCtx, p.URL)
-		cancel()
+//
+// Only ONLINE peers' mirrors take part in the election. A peer whose pull
+// failed this cycle but is still ONLINE keeps offering what it last
+// reported, rather than having all its items withdrawn over one slow
+// request.
+//
+// It returns how many local items changed, so the caller can notify peers.
+func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, refreshLocal bool, peerFetchTimeout time.Duration) (int, error) {
+	localChanges := 0
+	if refreshLocal {
+		n, err := ix.Refresh(ctx)
 		if err != nil {
-			// One unreachable peer shouldn't abort the whole sync.
-			log.Printf("catalog sync: peer %s: %v", p.ID, err)
+			return 0, fmt.Errorf("local catalog: %w", err)
+		}
+		localChanges = n
+	} else if err := ix.EnsureIndexed(ctx); err != nil {
+		return 0, fmt.Errorf("local catalog: %w", err)
+	}
+
+	all := registry.List()
+	online := make([]peers.Peer, 0, len(all))
+	onlineIDs := make(map[string]bool, len(all))
+	for _, p := range all {
+		if p.State == peers.StateOnline {
+			online = append(online, p)
+			onlineIDs[p.ID] = true
+		}
+	}
+	pullPeers(ctx, db, online, peerFetchTimeout, log.Printf)
+	if err := pruneRemovedPeers(ctx, db, all); err != nil {
+		return localChanges, fmt.Errorf("pruning removed peers: %w", err)
+	}
+
+	desired, err := elect(ctx, db, onlineIDs)
+	if err != nil {
+		return localChanges, fmt.Errorf("electing: %w", err)
+	}
+	if err := writeElection(ctx, db, desired); err != nil {
+		return localChanges, err
+	}
+	return localChanges, nil
+}
+
+// itemState is the election-relevant content of one catalog_items row.
+type itemState struct {
+	name, mediaType             string
+	local                       bool
+	localItemID                 string // "" stored as NULL
+	peerID, peerItemID          string // "" stored as NULL
+	seriesGlobalID, seriesName  string
+	seasonNumber, episodeNumber int
+}
+
+func stateFromEntry(e Entry) itemState {
+	return itemState{
+		name: e.Name, mediaType: e.MediaType,
+		seriesGlobalID: e.SeriesGlobalID, seriesName: e.SeriesName,
+		seasonNumber: e.SeasonNumber, episodeNumber: e.EpisodeNumber,
+	}
+}
+
+// elect computes the desired catalog_items content from the local index and
+// the mirrors of the given peers.
+func elect(ctx context.Context, db *sql.DB, onlinePeers map[string]bool) (map[string]itemState, error) {
+	desired := make(map[string]itemState)
+
+	rows, err := db.QueryContext(ctx, `SELECT entry FROM local_catalog WHERE deleted = 0`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var raw string
+		var e Entry
+		if err := rows.Scan(&raw); err == nil {
+			err = json.Unmarshal([]byte(raw), &e)
+		}
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		st := stateFromEntry(e)
+		st.local = true
+		st.localItemID = e.ItemID
+		desired[e.GlobalID] = st
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Ordered by peer_id, so the first offer seen for an item comes from
+	// the lexicographically smallest peer: that's the elected primary.
+	rows, err = db.QueryContext(ctx, `SELECT peer_id, global_id, entry FROM peer_catalog ORDER BY global_id, peer_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var peerID, globalID, raw string
+		if err := rows.Scan(&peerID, &globalID, &raw); err != nil {
+			return nil, err
+		}
+		if !onlinePeers[peerID] {
 			continue
 		}
-		for _, e := range entries {
-			if remoteOffers[e.GlobalID] == nil {
-				remoteOffers[e.GlobalID] = make(map[string]Entry)
-			}
-			remoteOffers[e.GlobalID][p.ID] = e
+		if _, taken := desired[globalID]; taken {
+			continue // local always wins, then the first (smallest) peer
 		}
+		var e Entry
+		if err := json.Unmarshal([]byte(raw), &e); err != nil {
+			return nil, err
+		}
+		st := stateFromEntry(e)
+		st.peerID = peerID
+		st.peerItemID = e.ItemID
+		desired[globalID] = st
+	}
+	return desired, rows.Err()
+}
+
+// writeElection diffs desired against catalog_items and applies only the
+// differences, in one transaction:
+//   - new or changed items are upserted (strm_path is left alone; Reconcile
+//     owns it);
+//   - rows still marked local whose global_id is no longer produced are
+//     deleted outright. This happens whenever the fallback title/season/
+//     episode hash an item resolves to changes (e.g. a join that
+//     momentarily failed to attach series/season/episode data), and local
+//     items never have a strm_path to clean up;
+//   - remote rows no current peer offers (typically: the peer went offline
+//     or was removed) have their election cleared rather than being deleted,
+//     so Reconcile (which runs right after, reading this same table) sees
+//     peer_id="" and removes the orphaned .strm this same cycle;
+//   - rows that are fully inert (not local, no election, no .strm left to
+//     clean up — Reconcile handled them in a prior cycle) are deleted.
+func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState) error {
+	existing := make(map[string]itemState)
+	rows, err := db.QueryContext(ctx, `
+		SELECT global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id,
+		       series_global_id, series_name, season_number, episode_number
+		FROM catalog_items
+	`)
+	if err != nil {
+		return fmt.Errorf("reading catalog items: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		var st itemState
+		var localItemID, peerID, peerItemID sql.NullString
+		if err := rows.Scan(&id, &st.name, &st.mediaType, &st.local, &localItemID, &peerID, &peerItemID,
+			&st.seriesGlobalID, &st.seriesName, &st.seasonNumber, &st.episodeNumber); err != nil {
+			rows.Close()
+			return fmt.Errorf("reading catalog items: %w", err)
+		}
+		st.localItemID, st.peerID, st.peerItemID = localItemID.String, peerID.String, peerItemID.String
+		existing[id] = st
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reading catalog items: %w", err)
 	}
 
 	now := time.Now().Unix()
-
-	for globalID, entry := range localByGlobalID {
-		if _, err := db.ExecContext(ctx, `
-			INSERT INTO catalog_items (global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, series_global_id, series_name, season_number, episode_number, updated_at)
-			VALUES (?, ?, ?, 1, ?, NULL, NULL, ?, ?, ?, ?, ?)
-			ON CONFLICT(global_id) DO UPDATE SET
-				name             = excluded.name,
-				media_type       = excluded.media_type,
-				local            = 1,
-				local_item_id    = excluded.local_item_id,
-				primary_peer_id  = NULL,
-				primary_item_id  = NULL,
-				series_global_id = excluded.series_global_id,
-				series_name      = excluded.series_name,
-				season_number    = excluded.season_number,
-				episode_number   = excluded.episode_number,
-				updated_at       = excluded.updated_at
-		`, globalID, entry.Name, entry.MediaType, entry.ItemID,
-			entry.SeriesGlobalID, entry.SeriesName, entry.SeasonNumber, entry.EpisodeNumber, now); err != nil {
-			return fmt.Errorf("upserting local catalog item %s: %w", globalID, err)
+	return withTx(ctx, db, func(tx *sql.Tx) error {
+		for id, st := range desired {
+			if old, ok := existing[id]; ok && old == st {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO catalog_items (global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, series_global_id, series_name, season_number, episode_number, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(global_id) DO UPDATE SET
+					name             = excluded.name,
+					media_type       = excluded.media_type,
+					local            = excluded.local,
+					local_item_id    = excluded.local_item_id,
+					primary_peer_id  = excluded.primary_peer_id,
+					primary_item_id  = excluded.primary_item_id,
+					series_global_id = excluded.series_global_id,
+					series_name      = excluded.series_name,
+					season_number    = excluded.season_number,
+					episode_number   = excluded.episode_number,
+					updated_at       = excluded.updated_at
+			`, id, st.name, st.mediaType, st.local, nullIfEmpty(st.localItemID), nullIfEmpty(st.peerID), nullIfEmpty(st.peerItemID),
+				st.seriesGlobalID, st.seriesName, st.seasonNumber, st.episodeNumber, now); err != nil {
+				return fmt.Errorf("upserting catalog item %s: %w", id, err)
+			}
 		}
-	}
 
-	for globalID, offers := range remoteOffers {
-		if _, isLocal := localByGlobalID[globalID]; isLocal {
-			continue // rule 1: local always wins
+		for id, old := range existing {
+			if _, ok := desired[id]; ok {
+				continue
+			}
+			switch {
+			case old.local:
+				if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_items WHERE global_id = ?`, id); err != nil {
+					return fmt.Errorf("deleting stale local catalog item %s: %w", id, err)
+				}
+			case old.peerID != "":
+				if _, err := tx.ExecContext(ctx, `UPDATE catalog_items SET primary_peer_id = NULL, primary_item_id = NULL WHERE global_id = ?`, id); err != nil {
+					return fmt.Errorf("clearing orphaned catalog item %s: %w", id, err)
+				}
+			}
 		}
-		primaryPeerID := electPrimary(offers)
-		primary := offers[primaryPeerID]
 
-		// No "WHERE local = 0" guard here: the isLocal check above already
-		// guarantees, from this cycle's fresh data, that the item isn't
-		// local right now — so it's always correct to force local=0. A
-		// guard keyed on the row's *previous* local value would block
-		// exactly the local-to-remote transition (item removed locally,
-		// still offered by a peer) that this branch exists to handle.
-		if _, err := db.ExecContext(ctx, `
-			INSERT INTO catalog_items (global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, series_global_id, series_name, season_number, episode_number, updated_at)
-			VALUES (?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(global_id) DO UPDATE SET
-				name             = excluded.name,
-				media_type       = excluded.media_type,
-				local            = 0,
-				local_item_id    = NULL,
-				primary_peer_id  = excluded.primary_peer_id,
-				primary_item_id  = excluded.primary_item_id,
-				series_global_id = excluded.series_global_id,
-				series_name      = excluded.series_name,
-				season_number    = excluded.season_number,
-				episode_number   = excluded.episode_number,
-				updated_at       = excluded.updated_at
-		`, globalID, primary.Name, primary.MediaType, primaryPeerID, primary.ItemID,
-			primary.SeriesGlobalID, primary.SeriesName, primary.SeasonNumber, primary.EpisodeNumber, now); err != nil {
-			return fmt.Errorf("upserting remote catalog item %s: %w", globalID, err)
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM catalog_items
+			WHERE local = 0 AND primary_peer_id IS NULL AND strm_path IS NULL
+		`); err != nil {
+			return fmt.Errorf("deleting inert catalog items: %w", err)
 		}
-	}
-
-	// Rows still marked local from a prior cycle whose global_id this
-	// cycle's scan no longer produces. This happens whenever the
-	// fallback title/season/episode hash an item resolves to changes
-	// (e.g. a join that momentarily failed to attach series/season/
-	// episode data) — the item gets upserted under a new global_id above,
-	// and without this the old row would linger forever, still local=1,
-	// still carrying whatever partial data it was first written with.
-	// Local items never have a strm_path to clean up, so it's safe to
-	// delete them outright rather than clear-and-reconcile like the
-	// remote path below.
-	if err := deleteStaleLocalItems(ctx, db, localByGlobalID); err != nil {
-		return fmt.Errorf("deleting stale local catalog items: %w", err)
-	}
-
-	// Items that are neither local nor offered by any current peer
-	// (typically: the peer that used to offer them was removed). Clear
-	// the election rather than deleting the row outright, so Reconcile
-	// (which runs right after Sync, reading this same table) sees
-	// peer_id="" and removes the orphaned .strm this same cycle instead
-	// of it lingering with a stale, now-unreachable primary_peer_id.
-	if err := clearOrphanedElections(ctx, db, localByGlobalID, remoteOffers); err != nil {
-		return fmt.Errorf("clearing orphaned catalog items: %w", err)
-	}
-	// Rows that are fully inert (not local, no election, no .strm left
-	// to clean up — i.e. Reconcile already handled them in a prior
-	// cycle) are safe to delete outright.
-	if _, err := db.ExecContext(ctx, `
-		DELETE FROM catalog_items
-		WHERE local = 0 AND primary_peer_id IS NULL AND strm_path IS NULL
-	`); err != nil {
-		return fmt.Errorf("deleting inert catalog items: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
-func deleteStaleLocalItems(ctx context.Context, db *sql.DB, local map[string]Entry) error {
-	rows, err := db.QueryContext(ctx, `SELECT global_id FROM catalog_items WHERE local = 1`)
-	if err != nil {
-		return err
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
 	}
-	var stale []string
-	for rows.Next() {
-		var globalID string
-		if err := rows.Scan(&globalID); err != nil {
-			rows.Close()
-			return err
-		}
-		if _, ok := local[globalID]; !ok {
-			stale = append(stale, globalID)
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for _, globalID := range stale {
-		if _, err := db.ExecContext(ctx, `DELETE FROM catalog_items WHERE global_id = ?`, globalID); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s
 }
-
-func clearOrphanedElections(ctx context.Context, db *sql.DB, local map[string]Entry, remote map[string]map[string]Entry) error {
-	rows, err := db.QueryContext(ctx, `SELECT global_id FROM catalog_items WHERE local = 0 AND primary_peer_id IS NOT NULL`)
-	if err != nil {
-		return err
-	}
-	var orphaned []string
-	for rows.Next() {
-		var globalID string
-		if err := rows.Scan(&globalID); err != nil {
-			rows.Close()
-			return err
-		}
-		if _, isLocal := local[globalID]; isLocal {
-			continue
-		}
-		if _, hasOffer := remote[globalID]; hasOffer {
-			continue
-		}
-		orphaned = append(orphaned, globalID)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for _, globalID := range orphaned {
-		if _, err := db.ExecContext(ctx, `
-			UPDATE catalog_items SET primary_peer_id = NULL, primary_item_id = NULL WHERE global_id = ?
-		`, globalID); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func electPrimary(offers map[string]Entry) string {
-	ids := make([]string, 0, len(offers))
-	for id := range offers {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids[0]
-}
-
-// SyncInterval is how often RunSyncLoop-style callers should re-sync.
-const SyncInterval = syncInterval

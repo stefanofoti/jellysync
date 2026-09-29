@@ -63,14 +63,17 @@ func main() {
 	}
 	go collector.Run(context.Background())
 
+	index, err := catalog.NewIndex(context.Background(), store, jf, cfg.Strm.OutputDir)
+	if err != nil {
+		log.Fatalf("catalog: %v", err)
+	}
+
 	tracker := syncstatus.NewTracker()
-	// Buffered size 1: a manual "sync now" trigger just needs to guarantee
-	// the loop wakes up promptly, not that every trigger while a sync is
-	// already running queues up a second one. The carried bool is the
-	// trigger's "force" flag (full Jellyfin rescan vs. just reading its
-	// current index).
-	triggerCh := make(chan bool, 1)
-	go runSyncAndReconcileLoop(context.Background(), store, jf, registry, cfg.Strm, cfg.PeerFetchTimeout, tracker, triggerCh)
+	// Manual "sync now" triggers and peers' change notifications queue a
+	// run here; requests arriving while one is pending coalesce rather than
+	// each queuing a run of their own.
+	queue := syncrun.NewQueue()
+	go runSyncAndReconcileLoop(context.Background(), store, jf, index, registry, cfg, tracker, queue)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +84,11 @@ func main() {
 			"uptime_seconds": int(time.Since(startedAt).Seconds()),
 		})
 	})
-	mux.HandleFunc("/api/v1/catalog", catalog.Handler(jf, cfg.Strm.OutputDir))
+	mux.HandleFunc("/api/v1/catalog", catalog.Handler(index))
+	mux.HandleFunc("GET /api/v1/catalog/changes", catalog.ChangesHandler(index))
+	mux.HandleFunc("POST /api/v1/catalog/notify", catalog.NotifyHandler(func() {
+		queue.Push(syncrun.Request{})
+	}))
 	mux.HandleFunc("GET /api/v1/proxy/stream/{peerID}/{itemID}", proxy.Handler(jf, registry, cfg.NodeID, collector, cfg.StreamBufferKB))
 	mux.HandleFunc("GET /api/v1/peers", peers.ListHandler(registry))
 	mux.HandleFunc("POST /api/v1/peers", peers.AddHandler(registry))
@@ -95,10 +102,7 @@ func main() {
 	mux.HandleFunc("PUT /api/v1/settings", settings.PutHandler(store))
 	mux.HandleFunc("GET /api/v1/sync/status", syncstatus.StatusHandler(tracker))
 	mux.HandleFunc("POST /api/v1/sync/trigger/{peerID}", synctrigger.Handler(registry, tracker, func(force bool) {
-		select {
-		case triggerCh <- force:
-		default:
-		}
+		queue.Push(syncrun.Request{ForceScan: force, RefreshLocal: true})
 	}))
 
 	webHandler, err := webui.Handler()
@@ -115,14 +119,15 @@ func main() {
 // refresh, then catalog.Sync, then strm.Reconcile — Reconcile always runs
 // right after Sync so a fresh election is reflected in .strm files within
 // the same cycle rather than racing an independent timer) on the
-// user-configured interval, or immediately whenever triggerCh fires (a
-// manual "sync now"). The scheduled interval never forces a Jellyfin
-// rescan — only a trigger with force=true does, since that's an explicit
+// user-configured interval, or immediately whenever queue has a request
+// (a manual "sync now", or a peer's change notification). The scheduled
+// interval re-reads the local Jellyfin index but never forces a rescan —
+// only a manual trigger with force=true does, since that's an explicit
 // "check for anything new" request rather than routine catalog upkeep.
-func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, peerFetchTimeout time.Duration, tracker *syncstatus.Tracker, triggerCh <-chan bool) {
-	force := false
+func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, index *catalog.Index, registry *peers.Registry, cfg *config.Config, tracker *syncstatus.Tracker, queue *syncrun.Queue) {
+	req := syncrun.Request{RefreshLocal: true}
 	for {
-		if err := syncrun.RunLocal(ctx, store, jf, registry, strmCfg, peerFetchTimeout, force, tracker); err != nil {
+		if err := syncrun.RunLocal(ctx, store, jf, index, registry, cfg.Strm, cfg.PeerFetchTimeout, req, cfg.NodeID, tracker); err != nil {
 			log.Printf("sync: %v", err)
 		}
 
@@ -132,12 +137,34 @@ func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Cl
 			interval = settings.DefaultSyncInterval
 		}
 
+		req = waitForNextRun(ctx, queue, interval)
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+// waitForNextRun blocks until a queued request arrives or interval elapses,
+// returning what the next run should do.
+func waitForNextRun(ctx context.Context, queue *syncrun.Queue, interval time.Duration) syncrun.Request {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
 		select {
 		case <-ctx.Done():
-			return
-		case force = <-triggerCh:
-		case <-time.After(interval):
-			force = false
+			return syncrun.Request{}
+		case <-queue.C():
+			// The wake token can outlive the request it announced (the
+			// timer branch below may already have taken it).
+			if req, ok := queue.Take(); ok {
+				return req
+			}
+		case <-timer.C:
+			req := syncrun.Request{RefreshLocal: true}
+			if queued, ok := queue.Take(); ok {
+				req = req.Merge(queued)
+			}
+			return req
 		}
 	}
 }

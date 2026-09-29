@@ -37,6 +37,45 @@ CREATE TABLE IF NOT EXISTS catalog_items (
 	updated_at       INTEGER NOT NULL
 );
 
+-- local_catalog is this node's own library as last read from Jellyfin, kept
+-- as a revisioned change log so peers can pull only what changed since
+-- their last sync (GET /api/v1/catalog/changes) instead of the whole
+-- catalog every cycle. Every insert/update/removal bumps rev to the next
+-- value of the catalog_head setting; removals stay behind as tombstones
+-- (deleted = 1) so peers learn about them too. entry is the wire-format
+-- catalog.Entry as JSON, hash its content digest for change detection.
+CREATE TABLE IF NOT EXISTS local_catalog (
+	global_id  TEXT PRIMARY KEY,
+	entry      TEXT NOT NULL,
+	hash       TEXT NOT NULL,
+	rev        INTEGER NOT NULL,
+	deleted    INTEGER NOT NULL DEFAULT 0,
+	updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS local_catalog_rev ON local_catalog (rev);
+
+-- peer_catalog mirrors each peer's local_catalog (live rows only), kept up
+-- to date incrementally from its change feed. gen is the resync generation
+-- the row was last written under: see catalog.pullPeer.
+CREATE TABLE IF NOT EXISTS peer_catalog (
+	peer_id   TEXT NOT NULL,
+	global_id TEXT NOT NULL,
+	entry     TEXT NOT NULL,
+	gen       INTEGER NOT NULL,
+	PRIMARY KEY (peer_id, global_id)
+);
+
+-- peer_sync_state is the per-peer change-feed cursor: which of the peer's
+-- catalog epochs we're following and the last rev applied from it.
+CREATE TABLE IF NOT EXISTS peer_sync_state (
+	peer_id   TEXT PRIMARY KEY,
+	epoch     TEXT NOT NULL DEFAULT '',
+	rev       INTEGER NOT NULL DEFAULT 0,
+	gen       INTEGER NOT NULL DEFAULT 0,
+	resync    INTEGER NOT NULL DEFAULT 0,
+	synced_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS peer_traffic (
 	peer_id   TEXT NOT NULL,
 	direction TEXT NOT NULL,
