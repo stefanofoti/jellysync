@@ -66,8 +66,10 @@ func main() {
 	tracker := syncstatus.NewTracker()
 	// Buffered size 1: a manual "sync now" trigger just needs to guarantee
 	// the loop wakes up promptly, not that every trigger while a sync is
-	// already running queues up a second one.
-	triggerCh := make(chan struct{}, 1)
+	// already running queues up a second one. The carried bool is the
+	// trigger's "force" flag (full Jellyfin rescan vs. just reading its
+	// current index).
+	triggerCh := make(chan bool, 1)
 	go runSyncAndReconcileLoop(context.Background(), store, jf, registry, cfg.Strm, cfg.PeerFetchTimeout, tracker, triggerCh)
 
 	mux := http.NewServeMux()
@@ -92,9 +94,9 @@ func main() {
 	mux.HandleFunc("GET /api/v1/settings", settings.GetHandler(store))
 	mux.HandleFunc("PUT /api/v1/settings", settings.PutHandler(store))
 	mux.HandleFunc("GET /api/v1/sync/status", syncstatus.StatusHandler(tracker))
-	mux.HandleFunc("POST /api/v1/sync/trigger/{peerID}", synctrigger.Handler(registry, tracker, func() {
+	mux.HandleFunc("POST /api/v1/sync/trigger/{peerID}", synctrigger.Handler(registry, tracker, func(force bool) {
 		select {
-		case triggerCh <- struct{}{}:
+		case triggerCh <- force:
 		default:
 		}
 	}))
@@ -109,14 +111,18 @@ func main() {
 	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
 }
 
-// runSyncAndReconcileLoop runs syncrun.RunLocal (Jellyfin refresh, then
-// catalog.Sync, then strm.Reconcile — Reconcile always runs right after
-// Sync so a fresh election is reflected in .strm files within the same
-// cycle rather than racing an independent timer) on the user-configured
-// interval, or immediately whenever triggerCh fires (a manual "sync now").
-func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, peerFetchTimeout time.Duration, tracker *syncstatus.Tracker, triggerCh <-chan struct{}) {
+// runSyncAndReconcileLoop runs syncrun.RunLocal (optionally a Jellyfin
+// refresh, then catalog.Sync, then strm.Reconcile — Reconcile always runs
+// right after Sync so a fresh election is reflected in .strm files within
+// the same cycle rather than racing an independent timer) on the
+// user-configured interval, or immediately whenever triggerCh fires (a
+// manual "sync now"). The scheduled interval never forces a Jellyfin
+// rescan — only a trigger with force=true does, since that's an explicit
+// "check for anything new" request rather than routine catalog upkeep.
+func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, peerFetchTimeout time.Duration, tracker *syncstatus.Tracker, triggerCh <-chan bool) {
+	force := false
 	for {
-		if err := syncrun.RunLocal(ctx, store, jf, registry, strmCfg, peerFetchTimeout, tracker); err != nil {
+		if err := syncrun.RunLocal(ctx, store, jf, registry, strmCfg, peerFetchTimeout, force, tracker); err != nil {
 			log.Printf("sync: %v", err)
 		}
 
@@ -129,8 +135,9 @@ func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Cl
 		select {
 		case <-ctx.Done():
 			return
-		case <-triggerCh:
+		case force = <-triggerCh:
 		case <-time.After(interval):
+			force = false
 		}
 	}
 }

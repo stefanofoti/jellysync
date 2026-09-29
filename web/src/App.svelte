@@ -25,6 +25,7 @@
   let savingInterval = $state(false);
   let syncStatus = $state({}); // peer id ("local" included) -> {state, percent, started_at, finished_at, error}
   let triggering = $state(new Set()); // scopes currently mid-request: "local" | "remote" | "both"
+  let forceScan = $state(false); // force a real Jellyfin library rescan before syncing, instead of just reading its current index
 
   // Source filtering happens server-side (the `owners` param), before
   // pagination, so every page is full and the series tab is filtered too —
@@ -165,8 +166,9 @@
 
     triggering = new Set([...triggering, scope]);
     try {
+      const suffix = forceScan ? "?force=true" : "";
       await Promise.all(
-        targets.map((id) => fetch(`/api/v1/sync/trigger/${encodeURIComponent(id)}`, { method: "POST" })),
+        targets.map((id) => fetch(`/api/v1/sync/trigger/${encodeURIComponent(id)}${suffix}`, { method: "POST" })),
       );
       await refresh();
     } catch (e) {
@@ -875,6 +877,11 @@
               {triggering.has("both") ? "syncing…" : "local + remote"}
             </button>
           </div>
+
+          <label class="flex items-center gap-2 text-sm text-neutral-400">
+            <input type="checkbox" bind:checked={forceScan} />
+            force remote jellyfin sync
+          </label>
 
           <div class="space-y-2">
             {#each syncTargets as target (target.id)}

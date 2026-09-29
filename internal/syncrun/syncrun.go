@@ -29,22 +29,32 @@ const (
 	scanStartGrace = 10 * time.Second
 )
 
-// RunLocal refreshes this node's own Jellyfin library, then re-runs
-// catalog.Sync and strm.Reconcile so the refreshed library is reflected and
-// re-offered to peers. tracker's "local" entry is updated throughout.
-func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, peerFetchTimeout time.Duration, tracker *syncstatus.Tracker) error {
+// RunLocal re-runs catalog.Sync and strm.Reconcile so this node's catalog
+// and .strm files reflect Jellyfin's current index. If forceScan is set, it
+// first tells Jellyfin to rescan its library on disk and waits for that to
+// finish — otherwise it just reads whatever Jellyfin already has indexed,
+// which is far cheaper and is what the scheduled loop uses by default; a
+// full rescan is reserved for an explicit "force" sync-now request, since
+// forcing Jellyfin to re-walk its whole library every cycle is what made
+// routine syncs slow (and prone to the request timing out) even though the
+// library itself hadn't changed. tracker's "local" entry is updated
+// throughout.
+func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, peerFetchTimeout time.Duration, forceScan bool, tracker *syncstatus.Tracker) error {
 	started := time.Now()
-	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageScanning, StartedAt: started})
 
-	if err := jf.RefreshLibrary(ctx); err != nil {
-		err = fmt.Errorf("refreshing jellyfin library: %w", err)
-		fail(tracker, started, err)
-		return err
-	}
+	if forceScan {
+		tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageScanning, StartedAt: started})
 
-	if err := pollScan(ctx, jf, tracker, started); err != nil {
-		fail(tracker, started, err)
-		return err
+		if err := jf.RefreshLibrary(ctx); err != nil {
+			err = fmt.Errorf("refreshing jellyfin library: %w", err)
+			fail(tracker, started, err)
+			return err
+		}
+
+		if err := pollScan(ctx, jf, tracker, started); err != nil {
+			fail(tracker, started, err)
+			return err
+		}
 	}
 
 	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageCatalog, StartedAt: started})

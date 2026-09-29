@@ -23,17 +23,20 @@ const (
 	remotePollTimeout  = 30 * time.Minute
 )
 
-// Handler serves POST /api/v1/sync/trigger/{peerID}. triggerLocal is called
-// to wake the scheduled sync loop for peerID "local"; it should be a
-// non-blocking send (e.g. on a buffered size-1 channel).
-func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal func()) http.HandlerFunc {
+// Handler serves POST /api/v1/sync/trigger/{peerID}?force=true. triggerLocal
+// is called to wake the scheduled sync loop for peerID "local"; it should be
+// a non-blocking send (e.g. on a buffered size-1 channel). force controls
+// whether that sync also tells Jellyfin to rescan its library on disk
+// first, rather than just reading its current index — see syncrun.RunLocal.
+func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal func(force bool)) http.HandlerFunc {
 	client := &http.Client{Timeout: remoteHTTPTimeout}
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		peerID := r.PathValue("peerID")
+		force := r.URL.Query().Get("force") == "true"
 
 		if peerID == "" || peerID == "local" {
-			triggerLocal()
+			triggerLocal(force)
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
@@ -44,16 +47,20 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 			return
 		}
 
-		go triggerRemote(client, tracker, p)
+		go triggerRemote(client, tracker, p, force)
 		w.WriteHeader(http.StatusAccepted)
 	}
 }
 
-func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer) {
+func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer, force bool) {
 	started := time.Now()
 	tracker.Set(p.ID, syncstatus.Status{State: syncstatus.StateRunning, StartedAt: started})
 
-	req, err := http.NewRequest(http.MethodPost, p.URL+"/api/v1/sync/trigger/local", nil)
+	url := p.URL + "/api/v1/sync/trigger/local"
+	if force {
+		url += "?force=true"
+	}
+	req, err := http.NewRequest(http.MethodPost, url, nil)
 	if err == nil {
 		var resp *http.Response
 		resp, err = client.Do(req)
