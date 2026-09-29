@@ -1,9 +1,11 @@
 // Package synctrigger serves the manual "sync now" endpoint: POST
 // /api/v1/sync/trigger/{peerID}. peerID "local" (the only form this node's
-// own dashboard needs) wakes the scheduled sync loop immediately, mirroring
-// internal/proxy's local/forward split; any other peerID asks that peer's
-// own node to run its local sync, then polls that peer for status until it
-// finishes so its progress bar can be shown here too.
+// own dashboard needs) re-reads this node's Jellyfin index and syncs
+// (scan 2), mirroring internal/proxy's local/forward split. Any other peerID
+// is a remote sync: by default just a pull of the peers' cached catalogs
+// (scan 3), leaving that peer untouched; with force=true it first asks that
+// peer's node to refresh its own catalog from its Jellyfin, waits for it to
+// finish, then pulls. No path ever asks a Jellyfin to scan its files on disk.
 package synctrigger
 
 import (
@@ -25,11 +27,10 @@ const (
 )
 
 // Handler serves POST /api/v1/sync/trigger/{peerID}?force=true. triggerLocal
-// is called to wake the scheduled sync loop for peerID "local"; it should be
-// a non-blocking send (e.g. on a buffered size-1 channel). force controls
-// whether that sync also tells Jellyfin to rescan its library on disk
-// first, rather than just reading its current index — see syncrun.RunLocal.
-func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal func(force bool)) http.HandlerFunc {
+// queues a sync that refreshes this node's own catalog from its Jellyfin;
+// triggerPull queues a pull-only sync (peer catalogs, no local refresh).
+// Both should be non-blocking. force only matters for a remote peerID.
+func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal, triggerPull func()) http.HandlerFunc {
 	client := &http.Client{Timeout: remoteHTTPTimeout}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -37,8 +38,8 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 		force := r.URL.Query().Get("force") == "true"
 
 		if peerID == "" || peerID == "local" {
-			slog.Info("local sync requested", "force_jellyfin_rescan", force, "from", r.RemoteAddr)
-			triggerLocal(force)
+			slog.Info("local sync requested", "from", r.RemoteAddr)
+			triggerLocal()
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
@@ -50,21 +51,23 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 			return
 		}
 
-		go triggerRemote(client, tracker, p, force)
+		go triggerRemote(client, tracker, p, force, triggerPull)
 		w.WriteHeader(http.StatusAccepted)
 	}
 }
 
-func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer, force bool) {
+func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer, force bool, triggerPull func()) {
 	started := time.Now()
 	tracker.Set(p.ID, syncstatus.Status{State: syncstatus.StateRunning, StartedAt: started})
-	slog.Info("remote sync started", "peer", p.ID, "url", p.URL, "force_jellyfin_rescan", force)
+	slog.Info("remote sync started", "peer", p.ID, "url", p.URL, "force", force)
 
-	url := p.URL + "/api/v1/sync/trigger/local"
-	if force {
-		url += "?force=true"
+	if !force {
+		triggerPull()
+		waitForLocalRun(tracker, p.ID, started)
+		return
 	}
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+
+	req, err := http.NewRequest(http.MethodPost, p.URL+"/api/v1/sync/trigger/local", nil)
 	if err == nil {
 		var resp *http.Response
 		resp, err = client.Do(req)
@@ -80,13 +83,42 @@ func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Pee
 		return
 	}
 
-	pollRemoteStatus(client, tracker, p, started)
+	if !pollRemoteStatus(client, tracker, p, started) {
+		return
+	}
+	// The peer notifies us if its catalog changed, but pull regardless so a
+	// forced sync always ends with a fresh copy of its catalog.
+	triggerPull()
+}
+
+// waitForLocalRun mirrors this node's own "local" sync status onto peerID
+// once a run that started after `started` has finished, so a pull-only remote
+// sync shows progress and outcome on the dashboard.
+func waitForLocalRun(tracker *syncstatus.Tracker, peerID string, started time.Time) {
+	deadline := time.Now().Add(remotePollTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Second)
+		st, ok := tracker.Get("local")
+		if !ok || st.StartedAt.Before(started) {
+			continue
+		}
+		if st.State == syncstatus.StateSuccess || st.State == syncstatus.StateError {
+			st.StartedAt = started
+			tracker.Set(peerID, st)
+			slog.Info("remote sync finished", "peer", peerID, "state", st.State, "duration", time.Since(started).Round(time.Millisecond))
+			return
+		}
+		st.StartedAt = started
+		tracker.Set(peerID, st)
+	}
+	unreachable(tracker, peerID, started, fmt.Errorf("timed out waiting for the pull to finish"))
 }
 
 // pollRemoteStatus repeatedly reads the peer's own /api/v1/sync/status
 // until its "local" entry reports success or error, mirroring that status
-// (re-stamped with our own StartedAt) onto our tracker under p.ID.
-func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer, started time.Time) {
+// (re-stamped with our own StartedAt) onto our tracker under p.ID. It returns
+// true if the peer's sync succeeded.
+func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer, started time.Time) bool {
 	deadline := time.Now().Add(remotePollTimeout)
 	var lastStage syncstatus.Stage
 	for time.Now().Before(deadline) {
@@ -100,7 +132,7 @@ func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.
 		resp, err := client.Do(req)
 		if err != nil {
 			unreachable(tracker, p.ID, started, err)
-			return
+			return false
 		}
 		var all map[string]syncstatus.Status
 		decErr := json.NewDecoder(resp.Body).Decode(&all)
@@ -123,13 +155,14 @@ func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.
 		switch remoteLocal.State {
 		case syncstatus.StateSuccess:
 			slog.Info("remote sync finished", "peer", p.ID, "duration", time.Since(started).Round(time.Millisecond))
-			return
+			return true
 		case syncstatus.StateError:
 			slog.Warn("remote sync failed on the peer", "peer", p.ID, "duration", time.Since(started).Round(time.Millisecond), "peer_error", remoteLocal.Error)
-			return
+			return false
 		}
 	}
 	unreachable(tracker, p.ID, started, fmt.Errorf("timed out waiting for peer sync status"))
+	return false
 }
 
 func unreachable(tracker *syncstatus.Tracker, peerID string, started time.Time, err error) {

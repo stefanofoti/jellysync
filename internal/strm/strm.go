@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"jellysync/internal/config"
-	"jellysync/internal/jellyfin"
 	"jellysync/internal/logging"
 )
 
@@ -112,16 +111,12 @@ type Stats struct {
 	Removed   int // .strm files deleted (item now local or no longer offered)
 	Unchanged int // wanted .strm files already up to date
 	Failed    int // files that couldn't be written or removed
-	// LibraryRefreshed is whether Jellyfin was asked to rescan because
-	// something changed.
-	LibraryRefreshed bool
 }
 
 // Reconcile writes a .strm file for every remote-elected catalog item that
 // doesn't already have one, removes .strm files for items that are now
-// local or no longer elected to any peer, and triggers a local Jellyfin
-// library refresh if anything changed.
-func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.Strm) (Stats, error) {
+// local or no longer elected to any peer. It never asks Jellyfin to rescan.
+func Reconcile(ctx context.Context, db *sql.DB, cfg config.Strm) (Stats, error) {
 	var st Stats
 	for _, root := range []string{"movies", "series"} {
 		if err := os.MkdirAll(filepath.Join(cfg.OutputDir, root), 0o755); err != nil {
@@ -158,8 +153,6 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 		return st, err
 	}
 
-	changed := false
-
 	for _, r := range all {
 		// Series-root items have no downloadable file — only their
 		// episodes are playable — so they never get a .strm of their own.
@@ -177,7 +170,6 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 				if err := clearPath(ctx, db, r.globalID); err != nil {
 					return st, err
 				}
-				changed = true
 			}
 			continue
 		}
@@ -202,7 +194,6 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 		if wrote {
 			slog.Debug("wrote .strm file", "path", desiredPath, "peer", r.peerID, "item", r.globalID)
 			st.Written++
-			changed = true
 		} else {
 			st.Unchanged++
 		}
@@ -211,15 +202,6 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 			if err := setPath(ctx, db, r.globalID, desiredPath); err != nil {
 				return st, err
 			}
-		}
-	}
-
-	if changed {
-		slog.Info("asking local jellyfin to rescan for .strm changes", "written", st.Written, "removed", st.Removed)
-		if err := jf.RefreshLibrary(ctx); err != nil {
-			slog.Warn("triggering jellyfin library refresh; changes appear after its next scan", logging.Err(err))
-		} else {
-			st.LibraryRefreshed = true
 		}
 	}
 

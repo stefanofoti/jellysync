@@ -25,7 +25,7 @@
   let savingInterval = $state(false);
   let syncStatus = $state({}); // peer id ("local" included) -> {state, percent, started_at, finished_at, error}
   let triggering = $state(new Set()); // scopes currently mid-request: "local" | "remote" | "both"
-  let forceScan = $state(false); // force a real Jellyfin library rescan before syncing, instead of just reading its current index
+  let forceScan = $state(false); // remote sync only: first ask the peer to refresh its catalog from its own Jellyfin, instead of pulling its cached one
 
   // Source filtering happens server-side (the `owners` param), before
   // pagination, so every page is full and the series tab is filtered too —
@@ -194,9 +194,8 @@
     return "bg-neutral-700";
   }
 
-  // Only the "scanning" stage carries a real, measured percentage (from
-  // Jellyfin's own scan-progress API). Other stages, and older peers that
-  // predate the stage field, have no meaningful percent to show — an
+  // Only older peers (which reported a Jellyfin scan percentage) or a missing
+  // stage carry a percent; current stages have none to show — an
   // indeterminate bar communicates "still working" without faking a number.
   function syncShowsPercent(status) {
     return !status.stage || status.stage === "scanning";
@@ -905,7 +904,7 @@
 
           <label class="flex items-center gap-2 text-sm text-neutral-400">
             <input type="checkbox" bind:checked={forceScan} />
-            force remote jellyfin sync
+            force peer to refresh its catalog
           </label>
 
           <div class="space-y-2">

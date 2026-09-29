@@ -20,9 +20,8 @@ const defaultStreamBufferKB = 256
 // defaultJellyfinTimeoutSec bounds every individual request this node makes
 // to its own local Jellyfin, including catalog.Sync's recursive /Items
 // listing, which runs every sync cycle and is the slowest of these on a
-// large library or constrained hardware. Generous rather than tight: on an
-// explicit "force" sync-now, the rescan this node triggers beforehand can
-// also leave Jellyfin answering slower than usual.
+// large library or constrained hardware. Generous rather than tight so
+// a large library on constrained hardware still fits.
 const defaultJellyfinTimeoutSec = 240
 
 // defaultPeerFetchTimeoutSec bounds how long this node waits for a peer's

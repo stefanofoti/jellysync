@@ -9,14 +9,14 @@ func TestQueueCoalesces(t *testing.T) {
 	}
 
 	q.Push(Request{Reason: ReasonPeerNotify})
-	q.Push(Request{ForceScan: true, RefreshLocal: true, Reason: ReasonManualForce})
+	q.Push(Request{RefreshLocal: true, Reason: ReasonManual})
 	q.Push(Request{Reason: ReasonPeerNotify})
 
 	<-q.C()
 	got, ok := q.Take()
-	want := Request{ForceScan: true, RefreshLocal: true, Reason: "peer-notify+manual-force"}
+	want := Request{RefreshLocal: true, Reason: "peer-notify+manual"}
 	if !ok || got != want {
-		t.Fatalf("Take() = %+v, %v; want the merged force request", got, ok)
+		t.Fatalf("Take() = %+v, %v; want the merged request", got, ok)
 	}
 	if _, ok := q.Take(); ok {
 		t.Fatal("request delivered twice")

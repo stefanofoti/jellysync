@@ -113,13 +113,10 @@ func main() {
 	mux.HandleFunc("GET /api/v1/settings", settings.GetHandler(store))
 	mux.HandleFunc("PUT /api/v1/settings", settings.PutHandler(store))
 	mux.HandleFunc("GET /api/v1/sync/status", syncstatus.StatusHandler(tracker))
-	mux.HandleFunc("POST /api/v1/sync/trigger/{peerID}", synctrigger.Handler(registry, tracker, func(force bool) {
-		reason := syncrun.ReasonManual
-		if force {
-			reason = syncrun.ReasonManualForce
-		}
-		queue.Push(syncrun.Request{ForceScan: force, RefreshLocal: true, Reason: reason})
-	}))
+	mux.HandleFunc("POST /api/v1/sync/trigger/{peerID}", synctrigger.Handler(registry, tracker,
+		func() { queue.Push(syncrun.Request{RefreshLocal: true, Reason: syncrun.ReasonManual}) },
+		func() { queue.Push(syncrun.Request{Reason: syncrun.ReasonManual}) },
+	))
 
 	webHandler, err := webui.Handler()
 	if err != nil {
@@ -131,15 +128,14 @@ func main() {
 	fatal("http server stopped", http.ListenAndServe(cfg.ListenAddr, mux))
 }
 
-// runSyncAndReconcileLoop runs syncrun.RunLocal (optionally a Jellyfin
-// refresh, then catalog.Sync, then strm.Reconcile — Reconcile always runs
+// runSyncAndReconcileLoop runs syncrun.RunLocal (optionally a local
+// catalog refresh, then catalog.Sync, then strm.Reconcile — Reconcile always runs
 // right after Sync so a fresh election is reflected in .strm files within
 // the same cycle rather than racing an independent timer) on the
 // user-configured interval, or immediately whenever queue has a request
-// (a manual "sync now", or a peer's change notification). The scheduled
-// interval re-reads the local Jellyfin index but never forces a rescan —
-// only a manual trigger with force=true does, since that's an explicit
-// "check for anything new" request rather than routine catalog upkeep.
+// (a manual "sync now", or a peer's change notification). No run ever
+// asks Jellyfin to scan its files on disk; the local refresh only reads
+// Jellyfin's current index.
 func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, index *catalog.Index, registry *peers.Registry, cfg *config.Config, tracker *syncstatus.Tracker, queue *syncrun.Queue) {
 	req := syncrun.Request{RefreshLocal: true, Reason: syncrun.ReasonStartup}
 	for {
