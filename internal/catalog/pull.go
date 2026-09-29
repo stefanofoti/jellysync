@@ -74,6 +74,9 @@ func pullPeers(ctx context.Context, db *sql.DB, list []peers.Peer, timeout time.
 			started := time.Now()
 			st := PeerPullStats{Peer: p.ID}
 			st.Err = pullPeer(ctx, db, p, timeout, selfID, &st)
+			if st.Err == nil {
+				st.Err = markSynced(ctx, db, p.ID, time.Now())
+			}
 			st.Duration = time.Since(started)
 			out[i] = st
 			if st.Err != nil {
@@ -241,13 +244,14 @@ func applyChanges(ctx context.Context, db *sql.DB, peerID string, cur cursor, ch
 	err = withTx(ctx, db, func(tx *sql.Tx) error {
 		// The cursor goes first so the transaction starts as a writer (see
 		// Index.refreshLocked).
+		// synced_at is left alone: it only moves once a whole pull
+		// succeeds (see markSynced), not on every page.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO peer_sync_state (peer_id, epoch, rev, gen, resync, synced_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO peer_sync_state (peer_id, epoch, rev, gen, resync)
+			VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT(peer_id) DO UPDATE SET
-				epoch = excluded.epoch, rev = excluded.rev, gen = excluded.gen,
-				resync = excluded.resync, synced_at = excluded.synced_at
-		`, peerID, cur.epoch, cur.rev, cur.gen, cur.resync, time.Now().Unix()); err != nil {
+				epoch = excluded.epoch, rev = excluded.rev, gen = excluded.gen, resync = excluded.resync
+		`, peerID, cur.epoch, cur.rev, cur.gen, cur.resync); err != nil {
 			return fmt.Errorf("saving sync cursor: %w", err)
 		}
 		for _, c := range changes {
@@ -284,6 +288,37 @@ func applyChanges(ctx context.Context, db *sql.DB, peerID string, cur cursor, ch
 		return 0, 0, 0, err
 	}
 	return upserts, deletes, swept, nil
+}
+
+// markSynced records a fully successful pull from peerID at t.
+func markSynced(ctx context.Context, db *sql.DB, peerID string, t time.Time) error {
+	mirrorMu.Lock()
+	defer mirrorMu.Unlock()
+	if _, err := db.ExecContext(ctx, `UPDATE peer_sync_state SET synced_at = ? WHERE peer_id = ?`, t.Unix(), peerID); err != nil {
+		return fmt.Errorf("recording successful sync: %w", err)
+	}
+	return nil
+}
+
+// LastSyncTimes returns, per peer id, when this node last pulled that
+// peer's catalog completely and successfully. Peers never synced are
+// absent.
+func LastSyncTimes(ctx context.Context, db *sql.DB) (map[string]time.Time, error) {
+	rows, err := db.QueryContext(ctx, `SELECT peer_id, synced_at FROM peer_sync_state WHERE synced_at > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]time.Time)
+	for rows.Next() {
+		var id string
+		var unix int64
+		if err := rows.Scan(&id, &unix); err != nil {
+			return nil, err
+		}
+		out[id] = time.Unix(unix, 0)
+	}
+	return out, rows.Err()
 }
 
 // pruneRemovedPeers drops mirrors and cursors of peers no longer in the

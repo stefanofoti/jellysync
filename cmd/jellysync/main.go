@@ -100,7 +100,9 @@ func main() {
 		queue.Push(syncrun.Request{Reason: syncrun.ReasonPeerNotify})
 	}))
 	mux.HandleFunc("GET /api/v1/proxy/stream/{peerID}/{itemID}", proxy.Handler(jf, registry, cfg.NodeID, collector, cfg.StreamBufferKB))
-	mux.HandleFunc("GET /api/v1/peers", peers.ListHandler(registry))
+	mux.HandleFunc("GET /api/v1/peers", peers.ListHandler(registry, func(ctx context.Context) (map[string]time.Time, error) {
+		return catalog.LastSyncTimes(ctx, store)
+	}))
 	mux.HandleFunc("POST /api/v1/peers", peers.AddHandler(registry))
 	mux.HandleFunc("DELETE /api/v1/peers/{peerID}", peers.RemoveHandler(registry))
 	mux.HandleFunc("GET /api/v1/items", catalog.ItemsHandler(store))

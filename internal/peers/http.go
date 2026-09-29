@@ -20,15 +20,29 @@ type peerDTO struct {
 	State   string `json:"state"`
 	Version string `json:"version,omitempty"`
 	IP      string `json:"ip,omitempty"`
+	// LastSyncAt is when this node last pulled the peer's catalog
+	// successfully; absent if it never has.
+	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
 }
 
-// ListHandler serves GET /api/v1/peers.
-func ListHandler(registry *Registry) http.HandlerFunc {
+// ListHandler serves GET /api/v1/peers. lastSync supplies each peer's
+// last successful catalog sync (catalog.LastSyncTimes); it's injected
+// because the catalog package depends on this one, not the other way round.
+func ListHandler(registry *Registry, lastSync func(context.Context) (map[string]time.Time, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		synced, err := lastSync(r.Context())
+		if err != nil {
+			// Best-effort: the peer list is still useful without it.
+			slog.Warn("reading last sync times for peer list", logging.Err(err))
+		}
 		list := registry.List()
 		out := make([]peerDTO, 0, len(list))
 		for _, p := range list {
-			out = append(out, peerDTO{ID: p.ID, Name: p.Name, URL: p.URL, State: string(p.State), Version: p.Version, IP: p.IP})
+			dto := peerDTO{ID: p.ID, Name: p.Name, URL: p.URL, State: string(p.State), Version: p.Version, IP: p.IP}
+			if t, ok := synced[p.ID]; ok {
+				dto.LastSyncAt = &t
+			}
+			out = append(out, dto)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(out)

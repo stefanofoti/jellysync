@@ -226,6 +226,30 @@
     return `${formatBytes(bytesPerSec)}/s`;
   }
 
+  // ---- Peer last sync ------------------------------------------------
+  // last_sync_at is when this node last pulled the peer's catalog in full;
+  // absent if it never has. Re-rendered on every 5s refresh, which is
+  // plenty of resolution for a "N min ago" label.
+  function formatAgo(iso) {
+    const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    if (seconds < 60) return "just now";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} min ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return `${hours} h ${minutes % 60} min ago`;
+    return `${Math.floor(hours / 24)} days ago`;
+  }
+
+  function lastSyncLabel(peer) {
+    return peer.last_sync_at ? `synced ${formatAgo(peer.last_sync_at)}` : "never synced";
+  }
+
+  function lastSyncTitle(peer) {
+    return peer.last_sync_at
+      ? `Last successful catalog sync: ${new Date(peer.last_sync_at).toLocaleString()}`
+      : "No successful catalog sync with this peer yet";
+  }
+
   let libraryTotal = $derived(
     stats.reduce(
       (acc, s) => ({ movies: acc.movies + s.movies, series: acc.series + s.series, episodes: acc.episodes + s.episodes }),
@@ -559,8 +583,9 @@
                     {peer.ip || "IP unknown"}<span class="text-neutral-600">&nbsp;· {peer.url}</span>
                   </div>
                 </td>
-                <td class="px-4 py-2 text-right">
+                <td class="px-4 py-2 text-right whitespace-nowrap">
                   <span class={`rounded px-2 py-0.5 text-xs ${stateColor(peer.state)}`}>{peer.state}</span>
+                  <div class="text-neutral-500 text-xs mt-1" title={lastSyncTitle(peer)}>{lastSyncLabel(peer)}</div>
                 </td>
               </tr>
             {:else}
@@ -923,6 +948,7 @@
                     <div class="text-neutral-600 font-mono text-xs truncate">
                       {peer.ip || "IP unknown"} · {peer.version ? `v${peer.version}` : "version unknown"}
                     </div>
+                    <div class="text-neutral-500 text-xs truncate" title={lastSyncTitle(peer)}>{lastSyncLabel(peer)}</div>
                     <div class="text-neutral-700 font-mono text-xs truncate" title={peer.id}>{peer.id}</div>
                   </td>
                   <td class="px-2 py-2 align-top">

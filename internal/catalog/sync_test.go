@@ -303,3 +303,35 @@ func TestChangesFeed(t *testing.T) {
 		t.Fatalf("out-of-range page = %+v", f)
 	}
 }
+
+func TestLastSyncTimeOnlyMovesOnSuccess(t *testing.T) {
+	a := newNode(t, movies(2, 1))
+	b := newNode(t, nil)
+	reg := b.registry(t, config.Peer{ID: "a", URL: a.srv.URL})
+	ctx := context.Background()
+
+	if got, err := LastSyncTimes(ctx, b.db); err != nil || len(got) != 0 {
+		t.Fatalf("before any sync: %v, %v; want none", got, err)
+	}
+
+	mustSync(t, b, reg, true)
+	got, err := LastSyncTimes(ctx, b.db)
+	if err != nil || got["a"].IsZero() {
+		t.Fatalf("after sync: %v, %v; want a timestamp for peer a", got, err)
+	}
+	first := got["a"]
+
+	// Pretend it was long ago, then fail a pull: the timestamp must stay.
+	if _, err := b.db.Exec(`UPDATE peer_sync_state SET synced_at = 1000`); err != nil {
+		t.Fatal(err)
+	}
+	a.srv.Close()
+	st, err := Sync(ctx, b.db, b.ix, reg, false, time.Second, "test-node")
+	if err != nil || st.Peers[0].Err == nil {
+		t.Fatalf("expected the pull to fail, got stats %+v, err %v", st.Peers, err)
+	}
+	got, _ = LastSyncTimes(ctx, b.db)
+	if got["a"].Unix() != 1000 {
+		t.Errorf("failed pull moved last sync time to %v (first success was %v)", got["a"], first)
+	}
+}
