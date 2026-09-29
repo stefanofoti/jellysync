@@ -32,7 +32,7 @@ const (
 // RunLocal refreshes this node's own Jellyfin library, then re-runs
 // catalog.Sync and strm.Reconcile so the refreshed library is reflected and
 // re-offered to peers. tracker's "local" entry is updated throughout.
-func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, tracker *syncstatus.Tracker) error {
+func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, peerFetchTimeout time.Duration, tracker *syncstatus.Tracker) error {
 	started := time.Now()
 	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageScanning, StartedAt: started})
 
@@ -48,7 +48,7 @@ func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *pe
 	}
 
 	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageCatalog, StartedAt: started})
-	if err := catalog.Sync(ctx, db, jf, registry, strmCfg.OutputDir); err != nil {
+	if err := catalog.Sync(ctx, db, jf, registry, strmCfg.OutputDir, peerFetchTimeout); err != nil {
 		err = fmt.Errorf("catalog sync: %w", err)
 		fail(tracker, started, err)
 		return err

@@ -68,7 +68,7 @@ func main() {
 	// the loop wakes up promptly, not that every trigger while a sync is
 	// already running queues up a second one.
 	triggerCh := make(chan struct{}, 1)
-	go runSyncAndReconcileLoop(context.Background(), store, jf, registry, cfg.Strm, tracker, triggerCh)
+	go runSyncAndReconcileLoop(context.Background(), store, jf, registry, cfg.Strm, cfg.PeerFetchTimeout, tracker, triggerCh)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -114,9 +114,9 @@ func main() {
 // Sync so a fresh election is reflected in .strm files within the same
 // cycle rather than racing an independent timer) on the user-configured
 // interval, or immediately whenever triggerCh fires (a manual "sync now").
-func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, tracker *syncstatus.Tracker, triggerCh <-chan struct{}) {
+func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmCfg config.Strm, peerFetchTimeout time.Duration, tracker *syncstatus.Tracker, triggerCh <-chan struct{}) {
 	for {
-		if err := syncrun.RunLocal(ctx, store, jf, registry, strmCfg, tracker); err != nil {
+		if err := syncrun.RunLocal(ctx, store, jf, registry, strmCfg, peerFetchTimeout, tracker); err != nil {
 			log.Printf("sync: %v", err)
 		}
 

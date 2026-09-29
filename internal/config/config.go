@@ -21,6 +21,13 @@ const defaultStreamBufferKB = 256
 // syncrun triggers a full library rescan.
 const defaultJellyfinTimeoutSec = 60
 
+// defaultPeerFetchTimeoutSec bounds how long this node waits for a peer's
+// GET /api/v1/catalog to respond. That handler runs the peer's own
+// (possibly slow, same as defaultJellyfinTimeoutSec above) Jellyfin
+// listing, so this needs its own separate budget rather than reusing the
+// local Jellyfin timeout.
+const defaultPeerFetchTimeoutSec = 60
+
 type Config struct {
 	NodeID     string
 	ListenAddr string
@@ -32,6 +39,8 @@ type Config struct {
 	StreamBufferKB int
 	// JellyfinTimeout bounds every request to the local Jellyfin instance.
 	JellyfinTimeout time.Duration
+	// PeerFetchTimeout bounds each peer's GET /api/v1/catalog request during sync.
+	PeerFetchTimeout time.Duration
 }
 
 type Jellyfin struct {
@@ -93,6 +102,15 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("JELLYFIN_TIMEOUT_SEC must be positive, got %d", jellyfinTimeoutSec)
 	}
 	cfg.JellyfinTimeout = time.Duration(jellyfinTimeoutSec) * time.Second
+
+	peerFetchTimeoutSec, err := envIntOr("PEER_FETCH_TIMEOUT_SEC", defaultPeerFetchTimeoutSec)
+	if err != nil {
+		return nil, err
+	}
+	if peerFetchTimeoutSec <= 0 {
+		return nil, fmt.Errorf("PEER_FETCH_TIMEOUT_SEC must be positive, got %d", peerFetchTimeoutSec)
+	}
+	cfg.PeerFetchTimeout = time.Duration(peerFetchTimeoutSec) * time.Second
 
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("NODE_ID is required")

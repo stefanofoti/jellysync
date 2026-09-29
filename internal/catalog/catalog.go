@@ -20,9 +20,11 @@ import (
 )
 
 const syncInterval = 60 * time.Second
-const fetchTimeout = 15 * time.Second
 
-var httpClient = &http.Client{Timeout: fetchTimeout}
+// httpClient has no Timeout of its own: FetchPeerCatalog's caller bounds
+// each request via the context it passes in instead, so the deadline stays
+// configurable (see config.PeerFetchTimeout) rather than fixed here.
+var httpClient = &http.Client{}
 
 // Entry is the wire format exchanged over GET /api/v1/catalog.
 type Entry struct {
@@ -105,10 +107,10 @@ func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]E
 // Handler serves GET /api/v1/catalog with this node's local catalog.
 func Handler(jf *jellyfin.Client, strmDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		defer cancel()
-
-		entries, err := LocalEntries(ctx, jf, strmDir)
+		// No extra deadline layered on top of r.Context(): LocalEntries
+		// calls jf.ListItems, which is already bounded by the Jellyfin
+		// client's own configurable timeout (config.JellyfinTimeout).
+		entries, err := LocalEntries(r.Context(), jf, strmDir)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -147,7 +149,7 @@ func FetchPeerCatalog(ctx context.Context, peerURL string) ([]Entry, error) {
 //     offering the item is elected primary. This is a pure function of peer
 //     IDs (no latency/timing involved), which avoids two nodes racing to a
 //     different answer for the same item.
-func Sync(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmDir string) error {
+func Sync(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.Registry, strmDir string, peerFetchTimeout time.Duration) error {
 	local, err := LocalEntries(ctx, jf, strmDir)
 	if err != nil {
 		return fmt.Errorf("local catalog: %w", err)
@@ -167,7 +169,9 @@ func Sync(ctx context.Context, db *sql.DB, jf *jellyfin.Client, registry *peers.
 		if p.State != peers.StateOnline {
 			continue
 		}
-		entries, err := FetchPeerCatalog(ctx, p.URL)
+		peerCtx, cancel := context.WithTimeout(ctx, peerFetchTimeout)
+		entries, err := FetchPeerCatalog(peerCtx, p.URL)
+		cancel()
 		if err != nil {
 			// One unreachable peer shouldn't abort the whole sync.
 			log.Printf("catalog sync: peer %s: %v", p.ID, err)
