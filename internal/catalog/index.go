@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"sync"
@@ -60,10 +61,25 @@ func NewIndex(ctx context.Context, db *sql.DB, jf *jellyfin.Client, strmDir stri
 	return &Index{db: db, jf: jf, strmDir: strmDir}, nil
 }
 
+// RefreshStats describes what one Refresh found.
+type RefreshStats struct {
+	Total   int // items currently in the local library
+	Added   int
+	Updated int
+	Removed int
+	Purged  int   // expired tombstones garbage-collected
+	Head    int64 // feed head after the refresh
+	// ListDuration is the Jellyfin listing alone; Duration the whole refresh.
+	ListDuration time.Duration
+	Duration     time.Duration
+}
+
+// Changed is how many items were added, updated or removed.
+func (s RefreshStats) Changed() int { return s.Added + s.Updated + s.Removed }
+
 // Refresh re-reads the local Jellyfin library and records every difference
-// from the previous snapshot as a new revision, all in one transaction. It
-// returns how many rows changed (added, modified or removed).
-func (ix *Index) Refresh(ctx context.Context) (int, error) {
+// from the previous snapshot as a new revision, all in one transaction.
+func (ix *Index) Refresh(ctx context.Context) (RefreshStats, error) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	return ix.refreshLocked(ctx)
@@ -77,6 +93,7 @@ func (ix *Index) EnsureIndexed(ctx context.Context) error {
 	if _, ok, err := getSetting(ctx, ix.db, indexedAtKey); err != nil || ok {
 		return err
 	}
+	slog.Info("building initial local catalog index")
 	_, err := ix.refreshLocked(ctx)
 	return err
 }
@@ -86,11 +103,14 @@ type indexedRow struct {
 	deleted bool
 }
 
-func (ix *Index) refreshLocked(ctx context.Context) (int, error) {
+func (ix *Index) refreshLocked(ctx context.Context) (RefreshStats, error) {
+	started := time.Now()
+	var st RefreshStats
 	entries, err := LocalEntries(ctx, ix.jf, ix.strmDir)
 	if err != nil {
-		return 0, err
+		return st, err
 	}
+	st.ListDuration = time.Since(started)
 	// The same item can appear more than once (e.g. in two libraries); the
 	// last one wins, as it always has.
 	current := make(map[string]Entry, len(entries))
@@ -98,28 +118,33 @@ func (ix *Index) refreshLocked(ctx context.Context) (int, error) {
 		current[e.GlobalID] = e
 	}
 
+	if dups := len(entries) - len(current); dups > 0 {
+		slog.Debug("local library lists some items more than once; keeping one each", "duplicates", dups)
+	}
+	st.Total = len(current)
+
 	existing := make(map[string]indexedRow)
 	rows, err := ix.db.QueryContext(ctx, `SELECT global_id, hash, deleted FROM local_catalog`)
 	if err != nil {
-		return 0, err
+		return st, err
 	}
 	for rows.Next() {
 		var id string
 		var r indexedRow
 		if err := rows.Scan(&id, &r.hash, &r.deleted); err != nil {
 			rows.Close()
-			return 0, err
+			return st, err
 		}
 		existing[id] = r
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return st, err
 	}
 
 	head, err := getIntSetting(ctx, ix.db, headKey)
 	if err != nil {
-		return 0, err
+		return st, err
 	}
 
 	ids := make([]string, 0, len(current))
@@ -129,7 +154,6 @@ func (ix *Index) refreshLocked(ctx context.Context) (int, error) {
 	sort.Strings(ids)
 
 	now := time.Now()
-	changed := 0
 	err = withTx(ctx, ix.db, func(tx *sql.Tx) error {
 		// Write first: a transaction that reads before its first write can
 		// fail to upgrade to a writer (SQLITE_BUSY, which busy_timeout
@@ -143,11 +167,16 @@ func (ix *Index) refreshLocked(ctx context.Context) (int, error) {
 				return err
 			}
 			hash := contentHash(raw)
-			if old, ok := existing[id]; ok && !old.deleted && old.hash == hash {
+			old, ok := existing[id]
+			switch {
+			case ok && !old.deleted && old.hash == hash:
 				continue
+			case ok && !old.deleted:
+				st.Updated++
+			default:
+				st.Added++
 			}
 			head++
-			changed++
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO local_catalog (global_id, entry, hash, rev, deleted, updated_at)
 				VALUES (?, ?, ?, ?, 0, ?)
@@ -168,7 +197,7 @@ func (ix *Index) refreshLocked(ctx context.Context) (int, error) {
 		sort.Strings(removed)
 		for _, id := range removed {
 			head++
-			changed++
+			st.Removed++
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE local_catalog SET deleted = 1, rev = ?, updated_at = ? WHERE global_id = ?
 			`, head, now.Unix(), id); err != nil {
@@ -176,33 +205,41 @@ func (ix *Index) refreshLocked(ctx context.Context) (int, error) {
 			}
 		}
 
-		if err := gcTombstones(ctx, tx, now); err != nil {
+		if st.Purged, err = gcTombstones(ctx, tx, now); err != nil {
 			return err
 		}
 		return setSetting(ctx, tx, headKey, strconv.FormatInt(head, 10))
 	})
 	if err != nil {
-		return 0, err
+		return RefreshStats{}, err
 	}
-	return changed, nil
+	st.Head = head
+	st.Duration = time.Since(started)
+	slog.Debug("local catalog index refreshed",
+		"items", st.Total, "added", st.Added, "updated", st.Updated, "removed", st.Removed,
+		"tombstones_purged", st.Purged, "head", st.Head,
+		"jellyfin_listing", st.ListDuration.Round(time.Millisecond), "duration", st.Duration.Round(time.Millisecond))
+	return st, nil
 }
 
 // gcTombstones drops removals older than tombstoneTTL and raises the
 // feed's min rev past them, so a peer whose cursor predates what was
 // dropped is told to resync rather than silently missing a removal.
-func gcTombstones(ctx context.Context, tx *sql.Tx, now time.Time) error {
+func gcTombstones(ctx context.Context, tx *sql.Tx, now time.Time) (int, error) {
 	cutoff := now.Add(-tombstoneTTL).Unix()
 	var maxRev sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT MAX(rev) FROM local_catalog WHERE deleted = 1 AND updated_at < ?`, cutoff).Scan(&maxRev); err != nil {
-		return err
+		return 0, err
 	}
 	if !maxRev.Valid {
-		return nil
+		return 0, nil
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM local_catalog WHERE deleted = 1 AND rev <= ?`, maxRev.Int64); err != nil {
-		return err
+	res, err := tx.ExecContext(ctx, `DELETE FROM local_catalog WHERE deleted = 1 AND rev <= ?`, maxRev.Int64)
+	if err != nil {
+		return 0, err
 	}
-	return setSetting(ctx, tx, minRevKey, strconv.FormatInt(maxRev.Int64, 10))
+	purged, _ := res.RowsAffected()
+	return int(purged), setSetting(ctx, tx, minRevKey, strconv.FormatInt(maxRev.Int64, 10))
 }
 
 // Change is one entry of the change feed: either the item's current wire
@@ -230,6 +267,9 @@ type Feed struct {
 	// restarts the feed from the beginning.
 	Reset   bool     `json:"reset,omitempty"`
 	Changes []Change `json:"changes"`
+
+	// resetReason says why Reset was set, for logging on the serving side.
+	resetReason string
 }
 
 // Changes returns up to limit changes after rev since, oldest first. All
@@ -249,7 +289,17 @@ func (ix *Index) Changes(ctx context.Context, epoch string, since int64, limit i
 		if err != nil {
 			return err
 		}
-		if epoch != feed.Epoch || since < 0 || since > feed.Head || (since > 0 && since < minRev) {
+		switch {
+		case epoch == "":
+			feed.resetReason = "first sync"
+		case epoch != feed.Epoch:
+			feed.resetReason = "epoch changed"
+		case since < 0 || since > feed.Head:
+			feed.resetReason = "cursor out of range"
+		case since > 0 && since < minRev:
+			feed.resetReason = "cursor older than retained tombstones"
+		}
+		if feed.resetReason != "" {
 			feed.Reset = true
 			since = 0
 		}

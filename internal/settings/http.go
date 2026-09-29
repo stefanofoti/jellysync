@@ -3,8 +3,11 @@ package settings
 import (
 	"database/sql"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
+
+	"jellysync/internal/logging"
 )
 
 type settingsDTO struct {
@@ -36,10 +39,13 @@ func PutHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "sync_interval_seconds must be positive", http.StatusBadRequest)
 			return
 		}
-		if err := SetSyncInterval(r.Context(), db, time.Duration(body.SyncIntervalSeconds)*time.Second); err != nil {
+		interval := time.Duration(body.SyncIntervalSeconds) * time.Second
+		if err := SetSyncInterval(r.Context(), db, interval); err != nil {
+			slog.Error("saving sync interval", "interval", interval, logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		slog.Info("sync interval changed; takes effect after the current wait", "interval", interval)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

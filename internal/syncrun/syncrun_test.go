@@ -8,13 +8,14 @@ func TestQueueCoalesces(t *testing.T) {
 		t.Fatal("empty queue returned a request")
 	}
 
-	q.Push(Request{})
-	q.Push(Request{ForceScan: true, RefreshLocal: true})
-	q.Push(Request{})
+	q.Push(Request{Reason: ReasonPeerNotify})
+	q.Push(Request{ForceScan: true, RefreshLocal: true, Reason: ReasonManualForce})
+	q.Push(Request{Reason: ReasonPeerNotify})
 
 	<-q.C()
 	got, ok := q.Take()
-	if !ok || got != (Request{ForceScan: true, RefreshLocal: true}) {
+	want := Request{ForceScan: true, RefreshLocal: true, Reason: "peer-notify+manual-force"}
+	if !ok || got != want {
 		t.Fatalf("Take() = %+v, %v; want the merged force request", got, ok)
 	}
 	if _, ok := q.Take(); ok {

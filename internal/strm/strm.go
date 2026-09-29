@@ -6,7 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +14,7 @@ import (
 
 	"jellysync/internal/config"
 	"jellysync/internal/jellyfin"
+	"jellysync/internal/logging"
 )
 
 var illegalPathChars = regexp.MustCompile(`[/\x00]`)
@@ -104,14 +105,27 @@ type row struct {
 	seasonNumber, episodeNumber int
 }
 
+// Stats describes what one Reconcile changed on disk.
+type Stats struct {
+	Written   int // .strm files created or rewritten
+	Moved     int // of Written, how many replaced a file at an old path
+	Removed   int // .strm files deleted (item now local or no longer offered)
+	Unchanged int // wanted .strm files already up to date
+	Failed    int // files that couldn't be written or removed
+	// LibraryRefreshed is whether Jellyfin was asked to rescan because
+	// something changed.
+	LibraryRefreshed bool
+}
+
 // Reconcile writes a .strm file for every remote-elected catalog item that
 // doesn't already have one, removes .strm files for items that are now
 // local or no longer elected to any peer, and triggers a local Jellyfin
 // library refresh if anything changed.
-func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.Strm) error {
+func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.Strm) (Stats, error) {
+	var st Stats
 	for _, root := range []string{"movies", "series"} {
 		if err := os.MkdirAll(filepath.Join(cfg.OutputDir, root), 0o755); err != nil {
-			return fmt.Errorf("creating %s dir: %w", root, err)
+			return st, fmt.Errorf("creating %s dir: %w", root, err)
 		}
 	}
 
@@ -121,7 +135,7 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 		FROM catalog_items
 	`)
 	if err != nil {
-		return fmt.Errorf("querying catalog_items: %w", err)
+		return st, fmt.Errorf("querying catalog_items: %w", err)
 	}
 
 	var all []row
@@ -132,7 +146,7 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 		if err := rows.Scan(&r.globalID, &r.name, &r.mediaType, &localInt, &peerID, &itemID, &r.oldPath,
 			&r.seriesGlobalID, &r.seriesName, &r.seasonNumber, &r.episodeNumber); err != nil {
 			rows.Close()
-			return fmt.Errorf("scanning catalog_items: %w", err)
+			return st, fmt.Errorf("scanning catalog_items: %w", err)
 		}
 		r.local = localInt != 0
 		r.peerID = peerID.String
@@ -141,7 +155,7 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return st, err
 	}
 
 	changed := false
@@ -154,10 +168,14 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 		if !wantStrm {
 			if r.oldPath.Valid {
 				if err := removeStrm(r.oldPath.String, cfg.OutputDir); err != nil {
-					log.Printf("strm: removing %s: %v", r.oldPath.String, err)
+					slog.Warn("removing .strm file", "path", r.oldPath.String, logging.Err(err))
+					st.Failed++
+				} else {
+					slog.Debug("removed .strm file", "path", r.oldPath.String, "item", r.globalID, "now_local", r.local)
+					st.Removed++
 				}
 				if err := clearPath(ctx, db, r.globalID); err != nil {
-					return err
+					return st, err
 				}
 				changed = true
 			}
@@ -169,33 +187,43 @@ func Reconcile(ctx context.Context, db *sql.DB, jf *jellyfin.Client, cfg config.
 
 		if r.oldPath.Valid && r.oldPath.String != desiredPath {
 			if err := removeStrm(r.oldPath.String, cfg.OutputDir); err != nil {
-				log.Printf("strm: removing stale %s: %v", r.oldPath.String, err)
+				slog.Warn("removing stale .strm file", "path", r.oldPath.String, logging.Err(err))
+			} else {
+				st.Moved++
 			}
 		}
 
 		wrote, err := writeIfChanged(desiredPath, desiredContent)
 		if err != nil {
-			log.Printf("strm: writing %s: %v", desiredPath, err)
+			slog.Warn("writing .strm file", "path", desiredPath, logging.Err(err))
+			st.Failed++
 			continue
 		}
 		if wrote {
+			slog.Debug("wrote .strm file", "path", desiredPath, "peer", r.peerID, "item", r.globalID)
+			st.Written++
 			changed = true
+		} else {
+			st.Unchanged++
 		}
 
 		if !r.oldPath.Valid || r.oldPath.String != desiredPath {
 			if err := setPath(ctx, db, r.globalID, desiredPath); err != nil {
-				return err
+				return st, err
 			}
 		}
 	}
 
 	if changed {
+		slog.Info("asking local jellyfin to rescan for .strm changes", "written", st.Written, "removed", st.Removed)
 		if err := jf.RefreshLibrary(ctx); err != nil {
-			log.Printf("strm: triggering library refresh: %v", err)
+			slog.Warn("triggering jellyfin library refresh; changes appear after its next scan", logging.Err(err))
+		} else {
+			st.LibraryRefreshed = true
 		}
 	}
 
-	return nil
+	return st, nil
 }
 
 // writeIfChanged writes content to path (creating parent directories as

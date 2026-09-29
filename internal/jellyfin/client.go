@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -90,6 +91,7 @@ func (c *Client) RefreshLibrary(ctx context.Context) error {
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("refreshing library: status %d", resp.StatusCode)
 	}
+	slog.Debug("jellyfin library refresh requested")
 	return nil
 }
 
@@ -258,6 +260,8 @@ func hashParts(s string) string {
 
 // ListItems fetches the local movie/episode/series catalog.
 func (c *Client) ListItems(ctx context.Context) ([]CatalogItem, error) {
+	started := time.Now()
+	slog.Debug("listing jellyfin library")
 	req, err := c.NewRequest(ctx, http.MethodGet, "/Items", url.Values{
 		"Recursive":        {"true"},
 		"IncludeItemTypes": {"Movie,Episode,Series"},
@@ -281,7 +285,10 @@ func (c *Client) ListItems(ctx context.Context) ([]CatalogItem, error) {
 		return nil, fmt.Errorf("decoding items: %w", err)
 	}
 
-	return buildCatalogItems(parsed.Items), nil
+	items := buildCatalogItems(parsed.Items)
+	slog.Debug("listed jellyfin library", "raw_items", len(parsed.Items), "real_media", len(items),
+		"skipped_virtual", len(parsed.Items)-len(items), "duration", time.Since(started).Round(time.Millisecond))
+	return items, nil
 }
 
 // buildCatalogItems converts raw Jellyfin items into CatalogItems, joining

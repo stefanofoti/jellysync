@@ -53,6 +53,10 @@ Main loop, started in `main.go` (`syncrun.RunLocal`): `catalog.Sync` then `strm.
 
 **internal/webui** — `go:embed` of `static/`, the built Svelte dashboard (`web/`). Talks to the `/api/v1/*` endpoints above.
 
+## Logging
+
+Everything logs through `log/slog` (text handler, `key=value` attributes), configured once in `main.go` from `LOG_LEVEL` (`internal/logging`, default DEBUG). Conventions: errors go in an `err` attribute (`logging.Err(err)`), durations are rounded to ms. INFO is one summary line per sync step (`sync started`/`sync finished` carry a `reason`: startup, scheduled, manual, manual-force, peer-notify), plus peer state changes, notifications and config changes; DEBUG is per page/file/stream detail; WARN is anything degraded that the node recovers from (a failed peer pull, an unreachable peer); ERROR is a failed step. `catalog.Sync` and `strm.Reconcile` return stats structs (`SyncStats`, `strm.Stats`) that `syncrun.RunLocal` turns into its summary lines. Don't add per-heartbeat or per-dashboard-poll logs above DEBUG.
+
 ## Security model (v1)
 
 No auth between peer nodes yet — anything reachable at a configured peer address is trusted. The security boundary is a private network (VPN) between peers, not the app. Keep this in mind before adding any feature that assumes peer requests are otherwise verified.

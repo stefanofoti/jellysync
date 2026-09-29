@@ -9,10 +9,11 @@ package synctrigger
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
+	"jellysync/internal/logging"
 	"jellysync/internal/peers"
 	"jellysync/internal/syncstatus"
 )
@@ -36,6 +37,7 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 		force := r.URL.Query().Get("force") == "true"
 
 		if peerID == "" || peerID == "local" {
+			slog.Info("local sync requested", "force_jellyfin_rescan", force, "from", r.RemoteAddr)
 			triggerLocal(force)
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -43,6 +45,7 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 
 		p, found := registry.Get(peerID)
 		if !found {
+			slog.Warn("remote sync requested for unknown peer", "peer", peerID)
 			http.Error(w, "unknown peer", http.StatusNotFound)
 			return
 		}
@@ -55,6 +58,7 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer, force bool) {
 	started := time.Now()
 	tracker.Set(p.ID, syncstatus.Status{State: syncstatus.StateRunning, StartedAt: started})
+	slog.Info("remote sync started", "peer", p.ID, "url", p.URL, "force_jellyfin_rescan", force)
 
 	url := p.URL + "/api/v1/sync/trigger/local"
 	if force {
@@ -84,12 +88,13 @@ func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Pee
 // (re-stamped with our own StartedAt) onto our tracker under p.ID.
 func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.Peer, started time.Time) {
 	deadline := time.Now().Add(remotePollTimeout)
+	var lastStage syncstatus.Stage
 	for time.Now().Before(deadline) {
 		time.Sleep(remotePollInterval)
 
 		req, err := http.NewRequest(http.MethodGet, p.URL+"/api/v1/sync/status", nil)
 		if err != nil {
-			log.Printf("synctrigger: building status request for peer %s: %v", p.ID, err)
+			slog.Error("building remote sync status request", "peer", p.ID, logging.Err(err))
 			continue
 		}
 		resp, err := client.Do(req)
@@ -101,7 +106,7 @@ func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.
 		decErr := json.NewDecoder(resp.Body).Decode(&all)
 		resp.Body.Close()
 		if decErr != nil {
-			log.Printf("synctrigger: decoding status from peer %s: %v", p.ID, decErr)
+			slog.Warn("decoding remote sync status", "peer", p.ID, logging.Err(decErr))
 			continue
 		}
 
@@ -111,7 +116,16 @@ func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.
 		}
 		remoteLocal.StartedAt = started
 		tracker.Set(p.ID, remoteLocal)
-		if remoteLocal.State == syncstatus.StateSuccess || remoteLocal.State == syncstatus.StateError {
+		if remoteLocal.Stage != lastStage {
+			slog.Debug("remote sync progress", "peer", p.ID, "stage", remoteLocal.Stage, "percent", remoteLocal.Percent)
+			lastStage = remoteLocal.Stage
+		}
+		switch remoteLocal.State {
+		case syncstatus.StateSuccess:
+			slog.Info("remote sync finished", "peer", p.ID, "duration", time.Since(started).Round(time.Millisecond))
+			return
+		case syncstatus.StateError:
+			slog.Warn("remote sync failed on the peer", "peer", p.ID, "duration", time.Since(started).Round(time.Millisecond), "peer_error", remoteLocal.Error)
 			return
 		}
 	}
@@ -119,6 +133,7 @@ func pollRemoteStatus(client *http.Client, tracker *syncstatus.Tracker, p peers.
 }
 
 func unreachable(tracker *syncstatus.Tracker, peerID string, started time.Time, err error) {
+	slog.Warn("remote sync: peer unreachable", "peer", peerID, "duration", time.Since(started).Round(time.Millisecond), logging.Err(err))
 	tracker.Set(peerID, syncstatus.Status{
 		State: syncstatus.StateUnreachable, StartedAt: started, FinishedAt: time.Now(), Error: err.Error(),
 	})

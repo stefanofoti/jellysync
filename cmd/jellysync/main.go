@@ -4,14 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"jellysync/internal/catalog"
 	"jellysync/internal/config"
 	"jellysync/internal/db"
 	"jellysync/internal/jellyfin"
+	"jellysync/internal/logging"
 	"jellysync/internal/metrics"
 	"jellysync/internal/peers"
 	"jellysync/internal/proxy"
@@ -33,12 +35,18 @@ func main() {
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		fatal("invalid configuration", err)
 	}
+	logging.Setup(cfg.LogLevel)
+	slog.Info("jellysync starting",
+		"node", cfg.NodeID, "version", version, "listen", cfg.ListenAddr, "log_level", cfg.LogLevel.String(),
+		"db", cfg.DBPath, "jellyfin", cfg.Jellyfin.URL, "output_dir", cfg.Strm.OutputDir, "base_url", cfg.Strm.BaseURL,
+		"configured_peers", len(cfg.Peers), "jellyfin_timeout", cfg.JellyfinTimeout,
+		"peer_fetch_timeout", cfg.PeerFetchTimeout, "stream_buffer_kb", cfg.StreamBufferKB)
 
 	store, err := db.Open(cfg.DBPath)
 	if err != nil {
-		log.Fatalf("db: %v", err)
+		fatal("opening database", err, "path", cfg.DBPath)
 	}
 	defer store.Close()
 
@@ -46,26 +54,28 @@ func main() {
 	pingCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := jf.Ping(pingCtx); err != nil {
-		log.Fatalf("cannot reach local jellyfin at %s: %v", cfg.Jellyfin.URL, err)
+		fatal("cannot reach local jellyfin", err, "url", cfg.Jellyfin.URL)
 	}
-	log.Printf("connected to local jellyfin at %s", cfg.Jellyfin.URL)
+	slog.Info("connected to local jellyfin", "url", cfg.Jellyfin.URL)
 
 	registry, err := peers.NewRegistry(context.Background(), store, cfg.Peers)
 	if err != nil {
-		log.Fatalf("peers: %v", err)
+		fatal("loading peers", err)
 	}
 	go registry.RunHeartbeat(context.Background())
-	log.Printf("tracking %d configured peer(s)", len(cfg.Peers))
+	for _, p := range registry.List() {
+		slog.Info("tracking peer", "peer", p.ID, "url", p.URL, "state", p.State)
+	}
 
 	collector, err := metrics.NewCollector(context.Background(), store)
 	if err != nil {
-		log.Fatalf("metrics: %v", err)
+		fatal("loading metrics", err)
 	}
 	go collector.Run(context.Background())
 
 	index, err := catalog.NewIndex(context.Background(), store, jf, cfg.Strm.OutputDir)
 	if err != nil {
-		log.Fatalf("catalog: %v", err)
+		fatal("opening catalog index", err)
 	}
 
 	tracker := syncstatus.NewTracker()
@@ -87,7 +97,7 @@ func main() {
 	mux.HandleFunc("/api/v1/catalog", catalog.Handler(index))
 	mux.HandleFunc("GET /api/v1/catalog/changes", catalog.ChangesHandler(index))
 	mux.HandleFunc("POST /api/v1/catalog/notify", catalog.NotifyHandler(func() {
-		queue.Push(syncrun.Request{})
+		queue.Push(syncrun.Request{Reason: syncrun.ReasonPeerNotify})
 	}))
 	mux.HandleFunc("GET /api/v1/proxy/stream/{peerID}/{itemID}", proxy.Handler(jf, registry, cfg.NodeID, collector, cfg.StreamBufferKB))
 	mux.HandleFunc("GET /api/v1/peers", peers.ListHandler(registry))
@@ -102,17 +112,21 @@ func main() {
 	mux.HandleFunc("PUT /api/v1/settings", settings.PutHandler(store))
 	mux.HandleFunc("GET /api/v1/sync/status", syncstatus.StatusHandler(tracker))
 	mux.HandleFunc("POST /api/v1/sync/trigger/{peerID}", synctrigger.Handler(registry, tracker, func(force bool) {
-		queue.Push(syncrun.Request{ForceScan: force, RefreshLocal: true})
+		reason := syncrun.ReasonManual
+		if force {
+			reason = syncrun.ReasonManualForce
+		}
+		queue.Push(syncrun.Request{ForceScan: force, RefreshLocal: true, Reason: reason})
 	}))
 
 	webHandler, err := webui.Handler()
 	if err != nil {
-		log.Fatalf("webui: %v", err)
+		fatal("loading web ui", err)
 	}
 	mux.Handle("/", webHandler)
 
-	log.Printf("jellysync (node %s) listening on %s", cfg.NodeID, cfg.ListenAddr)
-	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
+	slog.Info("listening", "addr", cfg.ListenAddr)
+	fatal("http server stopped", http.ListenAndServe(cfg.ListenAddr, mux))
 }
 
 // runSyncAndReconcileLoop runs syncrun.RunLocal (optionally a Jellyfin
@@ -125,17 +139,17 @@ func main() {
 // only a manual trigger with force=true does, since that's an explicit
 // "check for anything new" request rather than routine catalog upkeep.
 func runSyncAndReconcileLoop(ctx context.Context, store *sql.DB, jf *jellyfin.Client, index *catalog.Index, registry *peers.Registry, cfg *config.Config, tracker *syncstatus.Tracker, queue *syncrun.Queue) {
-	req := syncrun.Request{RefreshLocal: true}
+	req := syncrun.Request{RefreshLocal: true, Reason: syncrun.ReasonStartup}
 	for {
-		if err := syncrun.RunLocal(ctx, store, jf, index, registry, cfg.Strm, cfg.PeerFetchTimeout, req, cfg.NodeID, tracker); err != nil {
-			log.Printf("sync: %v", err)
-		}
+		// RunLocal logs its own outcome, errors included.
+		_ = syncrun.RunLocal(ctx, store, jf, index, registry, cfg.Strm, cfg.PeerFetchTimeout, req, cfg.NodeID, tracker)
 
 		interval, err := settings.GetSyncInterval(ctx, store)
 		if err != nil {
-			log.Printf("reading sync interval: %v", err)
+			slog.Warn("reading sync interval, using default", logging.Err(err), "default", settings.DefaultSyncInterval)
 			interval = settings.DefaultSyncInterval
 		}
+		slog.Debug("next scheduled sync", "in", interval, "at", time.Now().Add(interval).Format(time.RFC3339))
 
 		req = waitForNextRun(ctx, queue, interval)
 		if ctx.Err() != nil {
@@ -160,11 +174,17 @@ func waitForNextRun(ctx context.Context, queue *syncrun.Queue, interval time.Dur
 				return req
 			}
 		case <-timer.C:
-			req := syncrun.Request{RefreshLocal: true}
+			req := syncrun.Request{RefreshLocal: true, Reason: syncrun.ReasonScheduled}
 			if queued, ok := queue.Take(); ok {
 				req = req.Merge(queued)
 			}
 			return req
 		}
 	}
+}
+
+// fatal logs err at ERROR and exits.
+func fatal(msg string, err error, args ...any) {
+	slog.Error(msg, append([]any{logging.Err(err)}, args...)...)
+	os.Exit(1)
 }

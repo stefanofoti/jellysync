@@ -5,14 +5,16 @@ package proxy
 
 import (
 	"bytes"
+	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"jellysync/internal/jellyfin"
+	"jellysync/internal/logging"
 	"jellysync/internal/metrics"
 	"jellysync/internal/peers"
 )
@@ -84,21 +86,27 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 			trafficDir = metrics.In
 			trafficPeer = peerID
 		} else {
+			slog.Warn("stream requested for unknown peer (stale .strm?)", "peer", peerID, "item", itemID)
 			http.Error(w, "unknown peer", http.StatusNotFound)
 			return
 		}
 		if err != nil {
+			slog.Error("building upstream stream request", "peer", peerID, "item", itemID, logging.Err(err))
 			http.Error(w, "bad upstream request", http.StatusInternalServerError)
 			return
 		}
 
-		if rng := r.Header.Get("Range"); rng != "" {
+		rng := r.Header.Get("Range")
+		if rng != "" {
 			upstream.Header.Set("Range", rng)
 		}
+		log := slog.With("peer", peerID, "item", itemID, "direction", trafficDir, "traffic_peer", trafficPeer)
+		started := time.Now()
+		log.Debug("stream started", "range", rng)
 
 		resp, err := client.Do(upstream)
 		if err != nil {
-			log.Printf("proxy: peer=%s item=%s: %v", peerID, itemID, err)
+			log.Warn("stream upstream unreachable", "upstream", upstream.URL.Redacted(), logging.Err(err))
 			http.Error(w, "upstream unreachable", http.StatusBadGateway)
 			return
 		}
@@ -111,8 +119,8 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 			snippet := make([]byte, errorSnippetSize)
 			n, _ := io.ReadFull(resp.Body, snippet)
 			snippet = snippet[:n]
-			log.Printf("proxy: peer=%s item=%s: upstream %s returned %d: %q",
-				peerID, itemID, upstream.URL.Redacted(), resp.StatusCode, snippet)
+			log.Warn("stream upstream returned an error",
+				"upstream", upstream.URL.Redacted(), "status", resp.StatusCode, "body", string(snippet))
 			body = io.MultiReader(bytes.NewReader(snippet), resp.Body)
 		}
 
@@ -129,8 +137,16 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 		n, err := io.CopyBuffer(w, body, *buf)
 		copyBufferPool.Put(buf)
 		collector.RecordBytes(trafficPeer, trafficDir, n)
-		if err != nil {
-			log.Printf("proxy: peer=%s item=%s: copy: %v", peerID, itemID, err)
+		elapsed := time.Since(started)
+		switch {
+		case err != nil && r.Context().Err() != nil:
+			// The player went away mid-transfer: routine on seek/stop.
+			log.Debug("stream closed by client", "status", resp.StatusCode, "bytes", n, "duration", elapsed.Round(time.Millisecond))
+		case err != nil:
+			log.Warn("stream interrupted", "status", resp.StatusCode, "bytes", n, "duration", elapsed.Round(time.Millisecond), logging.Err(err))
+		default:
+			log.Debug("stream finished", "status", resp.StatusCode, "bytes", n, "duration", elapsed.Round(time.Millisecond),
+				"mbit_per_s", fmt.Sprintf("%.1f", float64(n)*8/1e6/max(elapsed.Seconds(), 0.001)))
 		}
 	}
 }

@@ -2,10 +2,13 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"jellysync/internal/logging"
 )
 
 // defaultStreamBufferKB is the read/write buffer size used to relay
@@ -42,6 +45,8 @@ type Config struct {
 	JellyfinTimeout time.Duration
 	// PeerFetchTimeout bounds each peer's GET /api/v1/catalog request during sync.
 	PeerFetchTimeout time.Duration
+	// LogLevel is the minimum level logged (LOG_LEVEL, default DEBUG).
+	LogLevel slog.Level
 }
 
 type Jellyfin struct {
@@ -112,6 +117,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("PEER_FETCH_TIMEOUT_SEC must be positive, got %d", peerFetchTimeoutSec)
 	}
 	cfg.PeerFetchTimeout = time.Duration(peerFetchTimeoutSec) * time.Second
+
+	logLevel, err := logging.ParseLevel(os.Getenv("LOG_LEVEL"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.LogLevel = logLevel
 
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("NODE_ID is required")

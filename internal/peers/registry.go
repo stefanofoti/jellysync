@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"jellysync/internal/config"
+	"jellysync/internal/logging"
 )
 
 type State string
@@ -151,6 +152,7 @@ func (r *Registry) AddPeer(ctx context.Context, id, url, name, version string) e
 	r.mu.Lock()
 	r.peers[id] = &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version, IP: resolveIP(ctx, url)}
 	r.mu.Unlock()
+	slog.Info("peer added", "peer", id, "url", url, "name", name, "version", version)
 
 	r.startHeartbeat(id)
 	return nil
@@ -172,6 +174,7 @@ func (r *Registry) RemovePeer(ctx context.Context, id string) error {
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM peers WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("removing peer %s: %w", id, err)
 	}
+	slog.Info("peer removed; its items are withdrawn at the next sync", "peer", id)
 	return nil
 }
 
@@ -321,8 +324,15 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	newName := p.Name
 	r.mu.Unlock()
 
-	if newState != prevState {
-		log.Printf("peer %s: %s -> %s", id, prevState, newState)
+	switch {
+	case newState == prevState:
+		if !healthy {
+			slog.Debug("peer health probe failed", "peer", id, "url", url, "state", newState, logging.Err(probeErr))
+		}
+	case newState == StateOnline:
+		slog.Info("peer is online", "peer", id, "was", prevState, "name", newName, "version", newVersion, "ip", ip)
+	default:
+		slog.Warn("peer is unreachable", "peer", id, "url", url, "was", prevState, "now", newState, logging.Err(probeErr))
 	}
 
 	var execErr error
@@ -336,7 +346,7 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 		`, string(newState), id)
 	}
 	if execErr != nil {
-		log.Printf("peer %s: failed to persist state: %v", id, execErr)
+		slog.Error("persisting peer state", "peer", id, logging.Err(execErr))
 	}
 }
 

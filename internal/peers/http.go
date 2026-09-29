@@ -3,11 +3,14 @@ package peers
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+
+	"jellysync/internal/logging"
 )
 
 type peerDTO struct {
@@ -55,11 +58,13 @@ func AddHandler(registry *Registry) http.HandlerFunc {
 
 		name, version, err := registry.Probe(ctx, strings.TrimRight(body.URL, "/"))
 		if err != nil {
+			slog.Warn("adding peer: unreachable", "url", body.URL, logging.Err(err))
 			http.Error(w, "peer unreachable: "+err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
 		id := uuid.NewString()
 		if err := registry.AddPeer(ctx, id, body.URL, name, version); err != nil {
+			slog.Error("adding peer", "url", body.URL, logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -76,6 +81,7 @@ func RemoveHandler(registry *Registry) http.HandlerFunc {
 			return
 		}
 		if err := registry.RemovePeer(r.Context(), id); err != nil {
+			slog.Error("removing peer", "peer", id, logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

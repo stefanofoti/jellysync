@@ -12,6 +12,8 @@ services:
       - DB_PATH=/data/jellysync.db
       - OUTPUT_DIR=/media/synced
       - BASE_URL=http://jellysync:8080
+      # DEBUG (default), INFO, WARN or ERROR.
+      - LOG_LEVEL=DEBUG
     volumes:
       - ./jellysync/data:/data
       - ./jellysync/media/synced:/media/synced

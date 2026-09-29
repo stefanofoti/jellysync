@@ -134,11 +134,18 @@ func (n *node) mirrorSize(t *testing.T, peerID string) int {
 	return c
 }
 
-func mustSync(t *testing.T, n *node, reg *peers.Registry, refreshLocal bool) {
+func mustSync(t *testing.T, n *node, reg *peers.Registry, refreshLocal bool) SyncStats {
 	t.Helper()
-	if _, err := Sync(context.Background(), n.db, n.ix, reg, refreshLocal, 5*time.Second); err != nil {
+	st, err := Sync(context.Background(), n.db, n.ix, reg, refreshLocal, 5*time.Second, "test-node")
+	if err != nil {
 		t.Fatalf("sync: %v", err)
 	}
+	for _, p := range st.Peers {
+		if p.Err != nil {
+			t.Fatalf("pulling peer %s: %v", p.Peer, p.Err)
+		}
+	}
+	return st
 }
 
 func assertItems(t *testing.T, got []string, want ...string) {
@@ -187,12 +194,15 @@ func TestSyncPullsOnlyChanges(t *testing.T) {
 
 	// A drops 2 and 3, gains 8; B picks up exactly that.
 	a.jf.set(map[string]string{"1": "Movie 1", "4": "Movie 4", "5": "Movie 5", "6": "Movie 6", "7": "Movie 7", "8": "Movie 8"})
-	if n, err := a.ix.Refresh(context.Background()); err != nil || n != 3 {
-		t.Fatalf("refresh: %d changes, err %v; want 3", n, err)
+	if st, err := a.ix.Refresh(context.Background()); err != nil || st.Added != 1 || st.Removed != 2 || st.Updated != 0 {
+		t.Fatalf("refresh: %+v, err %v; want 1 added, 2 removed", st, err)
 	}
-	mustSync(t, b, reg, false)
+	st := mustSync(t, b, reg, false)
 	assertItems(t, b.items(t),
 		"tmdb:1=local", "tmdb:4=a", "tmdb:5=a", "tmdb:6=a", "tmdb:7=a", "tmdb:8=a")
+	if p := st.Peers[0]; p.Upserts != 1 || p.Deletes != 2 || p.Resync || p.Legacy {
+		t.Errorf("delta pull stats = %+v, want 1 upsert, 2 deletes", p)
+	}
 }
 
 func TestSyncResyncsOnEpochChangeWithoutDroppingItems(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"jellysync/internal/jellyfin"
+	"jellysync/internal/logging"
 	"jellysync/internal/peers"
 )
 
@@ -75,14 +76,20 @@ func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]E
 	if err != nil {
 		return nil, err
 	}
+	excluded := 0
+	defer func() {
+		slog.Debug("local catalog built from jellyfin", "jellyfin_items", len(items), "kept", len(items)-excluded, "excluded_strm", excluded)
+	}()
 	cleanStrmDir := filepath.Clean(strmDir) + string(filepath.Separator)
 
 	entries := make([]Entry, 0, len(items))
 	for _, it := range items {
 		if strmDir != "" && strings.HasPrefix(filepath.Clean(it.Path)+string(filepath.Separator), cleanStrmDir) {
+			excluded++
 			continue
 		}
 		if strings.EqualFold(filepath.Ext(it.Path), ".strm") {
+			excluded++
 			continue
 		}
 		entries = append(entries, Entry{
@@ -109,18 +116,37 @@ func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]E
 // costs this node a full library scan per request.
 func Handler(ix *Index) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
 		if err := ix.EnsureIndexed(r.Context()); err != nil {
+			slog.Error("serving full catalog: indexing local library", "caller", caller(r), logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		entries, err := ix.Entries(r.Context())
 		if err != nil {
+			slog.Error("serving full catalog", "caller", caller(r), logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, r, catalogResponse{Items: entries})
+		slog.Info("served full catalog (legacy endpoint, peer predates the change feed)",
+			"caller", caller(r), "items", len(entries), "duration", time.Since(started).Round(time.Millisecond))
 	}
 }
+
+// caller identifies who made a peer-facing request, for logs: the
+// X-Jellysync-Peer header (the caller's NODE_ID) when sent, plus its
+// address.
+func caller(r *http.Request) string {
+	if id := r.Header.Get(peerHeader); id != "" {
+		return id + "@" + r.RemoteAddr
+	}
+	return r.RemoteAddr
+}
+
+// peerHeader carries the calling node's NODE_ID on peer-to-peer requests
+// (same header internal/proxy uses).
+const peerHeader = "X-Jellysync-Peer"
 
 const (
 	defaultChangesLimit = 1000
@@ -133,30 +159,42 @@ const (
 // costs one tiny request instead of a full catalog transfer. See Feed.
 func ChangesHandler(ix *Index) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
 		q := r.URL.Query()
 		since, err := strconv.ParseInt(q.Get("since"), 10, 64)
 		if err != nil && q.Get("since") != "" {
+			slog.Warn("bad catalog changes request", "caller", caller(r), "since", q.Get("since"))
 			http.Error(w, "invalid since", http.StatusBadRequest)
 			return
 		}
 		limit := defaultChangesLimit
 		if v := q.Get("limit"); v != "" {
 			if limit, err = strconv.Atoi(v); err != nil || limit <= 0 {
+				slog.Warn("bad catalog changes request", "caller", caller(r), "limit", v)
 				http.Error(w, "invalid limit", http.StatusBadRequest)
 				return
 			}
 			limit = min(limit, maxChangesLimit)
 		}
 		if err := ix.EnsureIndexed(r.Context()); err != nil {
+			slog.Error("serving catalog changes: indexing local library", "caller", caller(r), logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		feed, err := ix.Changes(r.Context(), q.Get("epoch"), since, limit)
 		if err != nil {
+			slog.Error("serving catalog changes", "caller", caller(r), logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, r, feed)
+		if feed.Reset {
+			slog.Info("peer catalog cursor reset, serving from the beginning",
+				"caller", caller(r), "reason", feed.resetReason, "their_since", since, "head", feed.Head)
+		}
+		slog.Debug("served catalog changes",
+			"caller", caller(r), "since", since, "changes", len(feed.Changes), "next", feed.Next,
+			"head", feed.Head, "more", feed.More, "duration", time.Since(started).Round(time.Millisecond))
 	}
 }
 
@@ -167,6 +205,7 @@ func ChangesHandler(ix *Index) http.HandlerFunc {
 // cheap, empty change-feed request per peer.
 func NotifyHandler(wake func()) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("peer reported catalog changes, queuing a pull", "caller", caller(r))
 		wake()
 		w.WriteHeader(http.StatusAccepted)
 	}
@@ -182,6 +221,7 @@ const notifyTimeout = 5 * time.Second
 func NotifyPeers(registry *peers.Registry, selfID string) {
 	for _, p := range registry.List() {
 		if p.State != peers.StateOnline {
+			slog.Debug("not notifying peer of catalog changes: not online", "peer", p.ID, "state", p.State)
 			continue
 		}
 		go func(p peers.Peer) {
@@ -191,13 +231,21 @@ func NotifyPeers(registry *peers.Registry, selfID string) {
 			if err != nil {
 				return
 			}
-			req.Header.Set("X-Jellysync-Peer", selfID)
+			req.Header.Set(peerHeader, selfID)
 			resp, err := httpClient.Do(req)
 			if err != nil {
-				log.Printf("catalog: notifying peer %s: %v", p.ID, err)
+				slog.Warn("notifying peer of catalog changes failed; it will catch up on its own schedule", "peer", p.ID, logging.Err(err))
 				return
 			}
 			resp.Body.Close()
+			switch resp.StatusCode {
+			case http.StatusAccepted:
+				slog.Debug("notified peer of catalog changes", "peer", p.ID)
+			case http.StatusNotFound, http.StatusMethodNotAllowed:
+				slog.Debug("peer predates change notifications; it will catch up on its own schedule", "peer", p.ID)
+			default:
+				slog.Warn("notifying peer of catalog changes: unexpected status", "peer", p.ID, "status", resp.StatusCode)
+			}
 		}(p)
 	}
 }
@@ -221,11 +269,12 @@ func writeJSON(w http.ResponseWriter, r *http.Request, v any) {
 
 // FetchPeerCatalog fetches a peer node's whole catalog over the legacy
 // GET /api/v1/catalog endpoint, for peers that predate the change feed.
-func FetchPeerCatalog(ctx context.Context, peerURL string) ([]Entry, error) {
+func FetchPeerCatalog(ctx context.Context, peerURL, selfID string) ([]Entry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, peerURL+"/api/v1/catalog", nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set(peerHeader, selfID)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching catalog from %s: %w", peerURL, err)
@@ -262,17 +311,21 @@ func FetchPeerCatalog(ctx context.Context, peerURL string) ([]Entry, error) {
 // reported, rather than having all its items withdrawn over one slow
 // request.
 //
-// It returns how many local items changed, so the caller can notify peers.
-func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, refreshLocal bool, peerFetchTimeout time.Duration) (int, error) {
-	localChanges := 0
+// The returned stats (partial on error) say what each step did; the
+// caller notifies peers when Local.Changed() > 0.
+func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, refreshLocal bool, peerFetchTimeout time.Duration, selfID string) (SyncStats, error) {
+	var st SyncStats
 	if refreshLocal {
-		n, err := ix.Refresh(ctx)
+		local, err := ix.Refresh(ctx)
 		if err != nil {
-			return 0, fmt.Errorf("local catalog: %w", err)
+			return st, fmt.Errorf("local catalog: %w", err)
 		}
-		localChanges = n
-	} else if err := ix.EnsureIndexed(ctx); err != nil {
-		return 0, fmt.Errorf("local catalog: %w", err)
+		st.Local, st.LocalRefreshed = local, true
+	} else {
+		slog.Debug("skipping local jellyfin re-read (pull-only sync)")
+		if err := ix.EnsureIndexed(ctx); err != nil {
+			return st, fmt.Errorf("local catalog: %w", err)
+		}
 	}
 
 	all := registry.List()
@@ -282,21 +335,51 @@ func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, 
 		if p.State == peers.StateOnline {
 			online = append(online, p)
 			onlineIDs[p.ID] = true
+		} else {
+			slog.Info("skipping peer this cycle: not online; its items are withdrawn until it is", "peer", p.ID, "state", p.State)
 		}
 	}
-	pullPeers(ctx, db, online, peerFetchTimeout, log.Printf)
+	st.PeersSkipped = len(all) - len(online)
+	st.Peers = pullPeers(ctx, db, online, peerFetchTimeout, selfID)
 	if err := pruneRemovedPeers(ctx, db, all); err != nil {
-		return localChanges, fmt.Errorf("pruning removed peers: %w", err)
+		return st, fmt.Errorf("pruning removed peers: %w", err)
 	}
 
+	started := time.Now()
 	desired, err := elect(ctx, db, onlineIDs)
 	if err != nil {
-		return localChanges, fmt.Errorf("electing: %w", err)
+		return st, fmt.Errorf("electing: %w", err)
 	}
-	if err := writeElection(ctx, db, desired); err != nil {
-		return localChanges, err
+	st.Election, err = writeElection(ctx, db, desired)
+	if err != nil {
+		return st, err
 	}
-	return localChanges, nil
+	st.Election.Duration = time.Since(started)
+	slog.Debug("election written",
+		"local_items", st.Election.Local, "remote_items", st.Election.Remote,
+		"upserted", st.Election.Upserted, "stale_local_deleted", st.Election.StaleLocalDeleted,
+		"orphans_cleared", st.Election.OrphansCleared, "inert_deleted", st.Election.InertDeleted,
+		"duration", st.Election.Duration.Round(time.Millisecond))
+	return st, nil
+}
+
+// SyncStats summarizes one Sync.
+type SyncStats struct {
+	Local          RefreshStats // zero unless LocalRefreshed
+	LocalRefreshed bool
+	Peers          []PeerPullStats // one per ONLINE peer
+	PeersSkipped   int             // peers not ONLINE
+	Election       ElectionStats
+}
+
+// ElectionStats describes what writeElection changed in catalog_items.
+type ElectionStats struct {
+	Local, Remote     int // desired rows by owner
+	Upserted          int // rows inserted or changed
+	StaleLocalDeleted int
+	OrphansCleared    int // remote rows no peer offers any more
+	InertDeleted      int
+	Duration          time.Duration
 }
 
 // itemState is the election-relevant content of one catalog_items row.
@@ -391,7 +474,15 @@ func elect(ctx context.Context, db *sql.DB, onlinePeers map[string]bool) (map[st
 //     peer_id="" and removes the orphaned .strm this same cycle;
 //   - rows that are fully inert (not local, no election, no .strm left to
 //     clean up — Reconcile handled them in a prior cycle) are deleted.
-func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState) error {
+func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState) (ElectionStats, error) {
+	var st ElectionStats
+	for _, d := range desired {
+		if d.local {
+			st.Local++
+		} else {
+			st.Remote++
+		}
+	}
 	existing := make(map[string]itemState)
 	rows, err := db.QueryContext(ctx, `
 		SELECT global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id,
@@ -399,31 +490,32 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 		FROM catalog_items
 	`)
 	if err != nil {
-		return fmt.Errorf("reading catalog items: %w", err)
+		return st, fmt.Errorf("reading catalog items: %w", err)
 	}
 	for rows.Next() {
 		var id string
-		var st itemState
+		var row itemState
 		var localItemID, peerID, peerItemID sql.NullString
-		if err := rows.Scan(&id, &st.name, &st.mediaType, &st.local, &localItemID, &peerID, &peerItemID,
-			&st.seriesGlobalID, &st.seriesName, &st.seasonNumber, &st.episodeNumber); err != nil {
+		if err := rows.Scan(&id, &row.name, &row.mediaType, &row.local, &localItemID, &peerID, &peerItemID,
+			&row.seriesGlobalID, &row.seriesName, &row.seasonNumber, &row.episodeNumber); err != nil {
 			rows.Close()
-			return fmt.Errorf("reading catalog items: %w", err)
+			return st, fmt.Errorf("reading catalog items: %w", err)
 		}
-		st.localItemID, st.peerID, st.peerItemID = localItemID.String, peerID.String, peerItemID.String
-		existing[id] = st
+		row.localItemID, row.peerID, row.peerItemID = localItemID.String, peerID.String, peerItemID.String
+		existing[id] = row
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("reading catalog items: %w", err)
+		return st, fmt.Errorf("reading catalog items: %w", err)
 	}
 
 	now := time.Now().Unix()
-	return withTx(ctx, db, func(tx *sql.Tx) error {
-		for id, st := range desired {
-			if old, ok := existing[id]; ok && old == st {
+	return st, withTx(ctx, db, func(tx *sql.Tx) error {
+		for id, d := range desired {
+			if old, ok := existing[id]; ok && old == d {
 				continue
 			}
+			st.Upserted++
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO catalog_items (global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, series_global_id, series_name, season_number, episode_number, updated_at)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -439,8 +531,8 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 					season_number    = excluded.season_number,
 					episode_number   = excluded.episode_number,
 					updated_at       = excluded.updated_at
-			`, id, st.name, st.mediaType, st.local, nullIfEmpty(st.localItemID), nullIfEmpty(st.peerID), nullIfEmpty(st.peerItemID),
-				st.seriesGlobalID, st.seriesName, st.seasonNumber, st.episodeNumber, now); err != nil {
+			`, id, d.name, d.mediaType, d.local, nullIfEmpty(d.localItemID), nullIfEmpty(d.peerID), nullIfEmpty(d.peerItemID),
+				d.seriesGlobalID, d.seriesName, d.seasonNumber, d.episodeNumber, now); err != nil {
 				return fmt.Errorf("upserting catalog item %s: %w", id, err)
 			}
 		}
@@ -454,19 +546,24 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 				if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_items WHERE global_id = ?`, id); err != nil {
 					return fmt.Errorf("deleting stale local catalog item %s: %w", id, err)
 				}
+				st.StaleLocalDeleted++
 			case old.peerID != "":
 				if _, err := tx.ExecContext(ctx, `UPDATE catalog_items SET primary_peer_id = NULL, primary_item_id = NULL WHERE global_id = ?`, id); err != nil {
 					return fmt.Errorf("clearing orphaned catalog item %s: %w", id, err)
 				}
+				st.OrphansCleared++
 			}
 		}
 
-		if _, err := tx.ExecContext(ctx, `
+		res, err := tx.ExecContext(ctx, `
 			DELETE FROM catalog_items
 			WHERE local = 0 AND primary_peer_id IS NULL AND strm_path IS NULL
-		`); err != nil {
+		`)
+		if err != nil {
 			return fmt.Errorf("deleting inert catalog items: %w", err)
 		}
+		inert, _ := res.RowsAffected()
+		st.InertDeleted = int(inert)
 		return nil
 	})
 }
