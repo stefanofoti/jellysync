@@ -171,3 +171,16 @@ func TestListItemsIntegration(t *testing.T) {
 	}
 	t.Logf("found item: %+v (GlobalID=%s)", *found, found.GlobalID())
 }
+
+func TestDropOrphans(t *testing.T) {
+	raw := []rawItem{
+		{Id: "a", Path: "/data/movies/A/a.mkv"},
+		{Id: "b", Path: "/data/removed-library/b.mkv"},
+		{Id: "c", Path: "/data/movies2/c.mkv"},
+		{Id: "d"},
+	}
+	kept, n := dropOrphans(raw, []string{"/data/movies", "/data/tv/"})
+	if n != 3-1 || len(kept) != 2 || kept[0].Id != "a" || kept[1].Id != "d" {
+		t.Fatalf("got %v (dropped %d)", kept, n)
+	}
+}

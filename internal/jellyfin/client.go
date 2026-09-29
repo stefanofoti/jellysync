@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"jellysync/internal/logging"
 )
 
 type Client struct {
@@ -222,10 +224,77 @@ func (c *Client) ListItems(ctx context.Context) ([]CatalogItem, error) {
 		return nil, fmt.Errorf("decoding items: %w", err)
 	}
 
-	items := buildCatalogItems(parsed.Items)
+	rawItems := parsed.Items
+	orphans := 0
+	if roots, err := c.libraryRoots(ctx); err != nil {
+		// Best-effort: without the library list we can't tell orphans apart,
+		// and dropping everything would be worse than offering a few stale items.
+		slog.Warn("could not list jellyfin libraries, skipping orphan filter", logging.Err(err))
+	} else {
+		rawItems, orphans = dropOrphans(rawItems, roots)
+	}
+
+	items := buildCatalogItems(rawItems)
 	slog.Debug("listed jellyfin library", "raw_items", len(parsed.Items), "real_media", len(items),
-		"skipped_virtual", len(parsed.Items)-len(items), "duration", time.Since(started).Round(time.Millisecond))
+		"skipped_orphans", orphans, "duration", time.Since(started).Round(time.Millisecond))
 	return items, nil
+}
+
+// libraryRoots returns every folder path of every library currently
+// configured in Jellyfin.
+func (c *Client) libraryRoots(ctx context.Context) ([]string, error) {
+	req, err := c.NewRequest(ctx, http.MethodGet, "/Library/VirtualFolders", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("listing libraries: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("listing libraries: status %d", resp.StatusCode)
+	}
+	var folders []struct {
+		Locations []string `json:"Locations"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&folders); err != nil {
+		return nil, fmt.Errorf("decoding libraries: %w", err)
+	}
+	var roots []string
+	for _, f := range folders {
+		roots = append(roots, f.Locations...)
+	}
+	return roots, nil
+}
+
+// dropOrphans removes items whose Path isn't under any library root. Jellyfin
+// keeps such rows in its DB when a library is removed while its folder is
+// unreachable (it won't purge items from a missing root), and /Items keeps
+// returning them even though the files are gone. Items with no Path (series
+// roots without one, virtual items) are left to isRealMedia.
+func dropOrphans(raw []rawItem, roots []string) ([]rawItem, int) {
+	kept := make([]rawItem, 0, len(raw))
+	for _, ri := range raw {
+		if ri.Path != "" && !underAny(ri.Path, roots) {
+			continue
+		}
+		kept = append(kept, ri)
+	}
+	return kept, len(raw) - len(kept)
+}
+
+func underAny(path string, roots []string) bool {
+	for _, root := range roots {
+		root = strings.TrimRight(root, `/\`)
+		if root == "" {
+			return true
+		}
+		if path == root || (strings.HasPrefix(path, root) && (path[len(root)] == '/' || path[len(root)] == '\\')) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildCatalogItems converts raw Jellyfin items into CatalogItems, joining
