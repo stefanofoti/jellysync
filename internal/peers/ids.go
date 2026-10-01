@@ -54,14 +54,31 @@ func (r *Registry) NewID(name string) string {
 	return idFor(name, func(id string) bool { _, ok := r.peers[id]; return ok })
 }
 
-// peerIDTables are every table column holding a peer registry id, all
-// rewritten together when a peer's id changes.
-var peerIDTables = []struct{ table, column string }{
-	{"peers", "id"},
-	{"peer_catalog", "peer_id"},
-	{"peer_sync_state", "peer_id"},
-	{"peer_traffic", "peer_id"},
-	{"catalog_items", "primary_peer_id"},
+// renamePeerID rewrites every column holding peer id oldID to newID.
+// newID is not a registered peer, but rows may already exist under it:
+// older builds persisted outgoing traffic under the caller's name (which
+// is what newID is derived from), so traffic is summed into those rows;
+// mirror/cursor rows under newID can only be leftovers of a removed peer,
+// so they're dropped before taking over the name.
+func renamePeerID(ctx context.Context, tx *sql.Tx, oldID, newID string) error {
+	stmts := []string{
+		`UPDATE peers SET id = ?2 WHERE id = ?1`,
+		`DELETE FROM peer_catalog WHERE peer_id = ?2`,
+		`UPDATE peer_catalog SET peer_id = ?2 WHERE peer_id = ?1`,
+		`DELETE FROM peer_sync_state WHERE peer_id = ?2`,
+		`UPDATE peer_sync_state SET peer_id = ?2 WHERE peer_id = ?1`,
+		`INSERT INTO peer_traffic (peer_id, direction, bytes)
+			SELECT ?2, direction, bytes FROM peer_traffic WHERE peer_id = ?1 AND true
+			ON CONFLICT(peer_id, direction) DO UPDATE SET bytes = bytes + excluded.bytes`,
+		`DELETE FROM peer_traffic WHERE peer_id = ?1`,
+		`UPDATE catalog_items SET primary_peer_id = ?2 WHERE primary_peer_id = ?1`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q, oldID, newID); err != nil {
+			return fmt.Errorf("renaming peer %s to %s: %w", oldID, newID, err)
+		}
+	}
+	return nil
 }
 
 // migrateUUIDIDs renames peers that still carry a generated UUID id (from
@@ -111,10 +128,8 @@ func migrateUUIDIDs(ctx context.Context, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 	for oldID, newID := range renames {
-		for _, t := range peerIDTables {
-			if _, err := tx.ExecContext(ctx, `UPDATE `+t.table+` SET `+t.column+` = ? WHERE `+t.column+` = ?`, newID, oldID); err != nil {
-				return fmt.Errorf("renaming peer %s to %s in %s: %w", oldID, newID, t.table, err)
-			}
+		if err := renamePeerID(ctx, tx, oldID, newID); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {

@@ -54,6 +54,11 @@ func TestMigrateUUIDIDs(t *testing.T) {
 		{`INSERT INTO peer_catalog (peer_id, global_id, entry, gen) VALUES (?, 'g1', '{}', 0)`, []any{b}},
 		{`INSERT INTO peer_sync_state (peer_id) VALUES (?)`, []any{b}},
 		{`INSERT INTO peer_traffic (peer_id, direction, bytes) VALUES (?, 'in', 5)`, []any{b}},
+		// Leftovers already keyed by the name b is about to take: legacy
+		// outgoing traffic (summed) and a removed peer's stale mirror (dropped).
+		{`INSERT INTO peer_traffic (peer_id, direction, bytes) VALUES ('node-a_01', 'in', 3), ('node-a_01', 'out', 4)`, nil},
+		{`INSERT INTO peer_catalog (peer_id, global_id, entry, gen) VALUES ('node-a_01', 'stale', '{}', 0)`, nil},
+		{`INSERT INTO peer_sync_state (peer_id) VALUES ('node-a_01')`, nil},
 		{`INSERT INTO catalog_items (global_id, media_type, primary_peer_id, updated_at) VALUES ('g1', 'movie', ?, 0)`, []any{b}},
 	} {
 		if _, err := store.Exec(q.sql, q.args...); err != nil {
@@ -86,10 +91,16 @@ func TestMigrateUUIDIDs(t *testing.T) {
 		}
 	}
 
+	var in, out int64
+	store.QueryRow(`SELECT bytes FROM peer_traffic WHERE peer_id = 'node-a_01' AND direction = 'in'`).Scan(&in)
+	store.QueryRow(`SELECT bytes FROM peer_traffic WHERE peer_id = 'node-a_01' AND direction = 'out'`).Scan(&out)
+	if in != 8 || out != 4 {
+		t.Errorf("traffic in/out = %d/%d, want 8/4", in, out)
+	}
+
 	for _, q := range []string{
 		`SELECT peer_id FROM peer_catalog`,
 		`SELECT peer_id FROM peer_sync_state`,
-		`SELECT peer_id FROM peer_traffic`,
 		`SELECT primary_peer_id FROM catalog_items`,
 	} {
 		var got string
