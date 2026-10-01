@@ -4,11 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 
 	"jellysync/internal/catalog"
+	"jellysync/internal/logging"
 	"jellysync/internal/peers"
 )
 
@@ -18,6 +20,19 @@ func TrafficHandler(c *Collector, registry *peers.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resolvedSnapshot(c, registry))
+	}
+}
+
+// ResetHandler serves DELETE /api/v1/traffic: clears all traffic stats.
+func ResetHandler(c *Collector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := c.Reset(r.Context()); err != nil {
+			slog.Error("clearing traffic stats", logging.Err(err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		slog.Info("traffic stats cleared")
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

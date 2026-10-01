@@ -124,6 +124,16 @@
     }
   }
 
+  async function clearTraffic() {
+    if (!confirm("Clear all traffic statistics? Totals and history for every peer are reset to zero.")) return;
+    const res = await fetch("/api/v1/traffic", { method: "DELETE" });
+    if (res.ok) {
+      await refresh();
+    } else {
+      error = await res.text();
+    }
+  }
+
   // ---- Settings modal: interval + manual sync -------------------------
   async function openSettings() {
     settingsOpen = true;
@@ -596,7 +606,12 @@
     </div>
 
     <section class="rounded border border-neutral-800 bg-neutral-900/50 min-w-0">
-      <h2 class="text-sm font-medium text-neutral-400 px-4 py-3 border-b border-neutral-800">Traffic</h2>
+      <div class="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
+        <h2 class="text-sm font-medium text-neutral-400">Traffic</h2>
+        {#if trafficPeerIds.length > 0}
+          <button class="text-neutral-500 hover:text-red-400 text-xs" onclick={clearTraffic}>clear</button>
+        {/if}
+      </div>
       <table class="w-full text-sm">
         <tbody>
           {#each trafficPeerIds as peerId (peerId)}

@@ -66,6 +66,10 @@ type counters struct {
 type Collector struct {
 	db *sql.DB
 
+	// flushMu serializes flush and Reset, so a flush that read totals
+	// before a Reset can't write them back after Reset cleared the table.
+	flushMu sync.Mutex
+
 	mu    sync.RWMutex
 	peers map[string]*counters
 }
@@ -183,6 +187,9 @@ func (c *Collector) sample() {
 }
 
 func (c *Collector) flush(ctx context.Context) {
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
+
 	c.mu.RLock()
 	snapshot := make(map[string]*counters, len(c.peers))
 	for id, cnt := range c.peers {
@@ -204,6 +211,22 @@ func (c *Collector) flush(ctx context.Context) {
 			ON CONFLICT(peer_id, direction) DO UPDATE SET bytes = excluded.bytes
 		`, peerID, out)
 	}
+}
+
+// Reset clears every peer's totals, current bitrate and history, both in
+// memory and in peer_traffic. In-flight streams keep counting from zero:
+// RecordBytes looks counters up per call, so it picks up fresh ones.
+func (c *Collector) Reset(ctx context.Context) error {
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
+
+	if _, err := c.db.ExecContext(ctx, `DELETE FROM peer_traffic`); err != nil {
+		return fmt.Errorf("clearing peer traffic: %w", err)
+	}
+	c.mu.Lock()
+	c.peers = make(map[string]*counters)
+	c.mu.Unlock()
+	return nil
 }
 
 // Snapshot returns the current traffic view for every peer that has ever

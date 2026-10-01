@@ -109,6 +109,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/items/series/episodes", catalog.SeriesEpisodesHandler(store))
 	mux.HandleFunc("GET /api/v1/stats", catalog.StatsHandler(store))
 	mux.HandleFunc("GET /api/v1/traffic", metrics.TrafficHandler(collector, registry))
+	mux.HandleFunc("DELETE /api/v1/traffic", metrics.ResetHandler(collector))
 	mux.HandleFunc("GET /metrics", metrics.OpenMetricsHandler(store, collector, registry))
 	mux.HandleFunc("GET /api/v1/settings", settings.GetHandler(store))
 	mux.HandleFunc("PUT /api/v1/settings", settings.PutHandler(store))
