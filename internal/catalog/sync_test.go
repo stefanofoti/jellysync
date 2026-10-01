@@ -93,7 +93,7 @@ func newNode(t *testing.T, movies map[string]string) *node {
 
 func (n *node) registry(t *testing.T, ps ...config.Peer) *peers.Registry {
 	t.Helper()
-	r, err := peers.NewRegistry(context.Background(), n.db, ps)
+	r, err := peers.NewRegistry(context.Background(), n.db, ps, nil)
 	if err != nil {
 		t.Fatalf("registry: %v", err)
 	}

@@ -16,6 +16,7 @@ import (
 	"jellysync/internal/jellyfin"
 	"jellysync/internal/logging"
 	"jellysync/internal/metrics"
+	"jellysync/internal/peerauth"
 	"jellysync/internal/peers"
 )
 
@@ -25,9 +26,9 @@ const (
 
 	// peerHeader carries the calling node's own ID on a forwarded stream
 	// request, so the peer serving the "local" branch can attribute
-	// outgoing traffic to the right caller. Self-reported, like every
-	// other cross-node interaction in this system (see "Security model"
-	// in CLAUDE.md) — trust boundary is the VPN, not this header.
+	// outgoing traffic to the right caller. Self-reported, so only used
+	// on the legacy port: on the peer port the caller's key identifies it
+	// (see "Security model" in CLAUDE.md).
 	peerHeader = "X-Jellysync-Peer"
 )
 
@@ -48,11 +49,9 @@ const (
 // read+write syscall pair, and a bigger buffer means fewer, larger
 // syscalls per second for a given bitrate.
 func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, collector *metrics.Collector, streamBufferKB int) http.HandlerFunc {
-	client := &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: responseHeaderTimeout,
-		},
-	}
+	transport := registry.Transport().Clone()
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	client := &http.Client{Transport: transport}
 
 	bufferSize := streamBufferKB * 1024
 	copyBufferPool := sync.Pool{
@@ -77,7 +76,11 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 			upstream, err = jf.NewDownloadRequest(r.Context(), itemID)
 			trafficDir = metrics.Out
 			trafficPeer = callerPeerID(registry, r)
-		} else if p, found := registry.Get(peerID); found {
+		} else if p, found := registry.Get(peerID); found && p.State == peers.StateDisabled {
+			slog.Warn("stream requested from a peer whose transport is turned off", "peer", peerID, "item", itemID)
+			http.Error(w, "peer disabled", http.StatusServiceUnavailable)
+			return
+		} else if found {
 			upstream, err = http.NewRequestWithContext(r.Context(), http.MethodGet,
 				p.URL+"/api/v1/proxy/stream/local/"+itemID, nil)
 			if err == nil {
@@ -151,13 +154,17 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 	}
 }
 
-// callerPeerID attributes a "local" stream request to the registry id of
-// the peer that made it. The header carries the caller's own NODE_ID, which
+// callerPeerID attributes a "local" stream request to the id of the node
+// that made it. On the peer port that's the key it authenticated with. On
+// the legacy port the header carries the caller's own NODE_ID, which
 // is our peer's Name, not the id we assigned it — recording the raw header
 // value would split one peer's traffic across two keys (incoming under its
 // id, outgoing under its name). Falls back to matching the source IP, then
 // to the raw header value, then "unknown".
 func callerPeerID(registry *peers.Registry, r *http.Request) string {
+	if c, ok := peerauth.CallerFrom(r.Context()); ok {
+		return c.ID()
+	}
 	nodeID := r.Header.Get(peerHeader)
 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

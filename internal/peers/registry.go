@@ -17,6 +17,7 @@ import (
 
 	"jellysync/internal/config"
 	"jellysync/internal/logging"
+	"jellysync/internal/peerauth"
 )
 
 type State string
@@ -25,6 +26,11 @@ const (
 	StateOnline   State = "ONLINE"
 	StateDegraded State = "DEGRADED"
 	StateOffline  State = "OFFLINE"
+	// StateDisabled marks a peer whose transport this node has turned off
+	// (HTTP_PEERS / MTLS_PEERS): it isn't probed, pulled or streamed from,
+	// but stays registered with its catalog mirror, so turning the
+	// transport back on resumes where it left off. Never persisted.
+	StateDisabled State = "DISABLED"
 )
 
 const (
@@ -42,14 +48,23 @@ type Peer struct {
 	Name    string // last-known /health "node_id" reported by this peer; display label only, "" until first successful probe
 	Version string // last-known /health "version" reported by this peer; "" until first successful probe
 	IP      string // last-known IP address of URL's host; display label and caller-attribution fallback only, "" until resolved
+	// Pin is the peer's key pin when it was paired by invite (reached
+	// with mTLS on its peer port); "" for a legacy peer added by URL.
+	Pin string
 
 	missed int
 }
 
 type Registry struct {
-	db      *sql.DB
-	http    *http.Client
-	baseCtx context.Context
+	db        *sql.DB
+	http      *http.Client
+	baseCtx   context.Context
+	identity  *peerauth.Identity
+	transport *http.Transport
+	others    OtherIDs
+	// httpOff/mtlsOff turn off legacy (by URL) and paired (mTLS) peers
+	// respectively; the zero value has both on. See SetTransports.
+	httpOff, mtlsOff bool
 
 	mu      sync.RWMutex
 	peers   map[string]*Peer
@@ -61,15 +76,19 @@ type Registry struct {
 // the table — not just the configured ones. This means a peer added at
 // runtime (e.g. via the web UI) persists across restarts even if it's
 // never added to the PEERS environment variable; the DB, not PEERS, is the
-// source of truth once the node has booted once.
-func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Registry, error) {
+// source of truth once the node has booted once. id is this node's own
+// key, presented to paired peers; with a nil id only legacy peers can be
+// reached.
+func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer, id *peerauth.Identity) (*Registry, error) {
 	r := &Registry{
-		db:      db,
-		http:    &http.Client{Timeout: heartbeatTimeout},
-		baseCtx: ctx,
-		peers:   make(map[string]*Peer),
-		cancels: make(map[string]context.CancelFunc),
+		db:       db,
+		baseCtx:  ctx,
+		identity: id,
+		peers:    make(map[string]*Peer),
+		cancels:  make(map[string]context.CancelFunc),
 	}
+	r.transport = peerauth.NewTransport(id, r.PinForAddr)
+	r.http = &http.Client{Timeout: heartbeatTimeout, Transport: r.transport}
 
 	for _, p := range configured {
 		_, err := db.ExecContext(ctx, `
@@ -85,7 +104,7 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Re
 		return nil, err
 	}
 
-	rows, err := db.QueryContext(ctx, `SELECT id, url, state, version, name FROM peers`)
+	rows, err := db.QueryContext(ctx, `SELECT id, url, state, version, name, pin FROM peers`)
 	if err != nil {
 		return nil, fmt.Errorf("loading peers: %w", err)
 	}
@@ -93,7 +112,7 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Re
 	for rows.Next() {
 		var p Peer
 		var state string
-		if err := rows.Scan(&p.ID, &p.URL, &state, &p.Version, &p.Name); err != nil {
+		if err := rows.Scan(&p.ID, &p.URL, &state, &p.Version, &p.Name, &p.Pin); err != nil {
 			return nil, fmt.Errorf("scanning peer: %w", err)
 		}
 		p.State = State(state)
@@ -144,19 +163,23 @@ func (r *Registry) Probe(ctx context.Context, url string) (name string, version 
 // seeding known-good peers (e.g. from config) without a network round trip.
 // name and version are whatever Probe returned (or "" if the caller has
 // none yet); the next heartbeat corrects both either way.
-func (r *Registry) AddPeer(ctx context.Context, id, url, name, version string) error {
+func (r *Registry) AddPeer(ctx context.Context, id, url, name, version, pin string) error {
 	url = strings.TrimRight(url, "/")
 	if _, err := r.db.ExecContext(ctx, `
-		INSERT INTO peers (id, url, state, name, version) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET url = excluded.url, name = excluded.name, version = excluded.version
-	`, id, url, StateOnline, name, version); err != nil {
+		INSERT INTO peers (id, url, state, name, version, pin) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET url = excluded.url, name = excluded.name, version = excluded.version, pin = excluded.pin
+	`, id, url, StateOnline, name, version, pin); err != nil {
 		return fmt.Errorf("adding peer %s: %w", id, err)
 	}
 
 	r.mu.Lock()
-	r.peers[id] = &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version, IP: resolveIP(ctx, url)}
+	p := &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version, IP: resolveIP(ctx, url), Pin: pin}
+	if !r.enabledLocked(p) {
+		p.State = StateDisabled
+	}
+	r.peers[id] = p
 	r.mu.Unlock()
-	slog.Info("peer added", "peer", id, "url", url, "name", name, "version", version)
+	slog.Info("peer added", "peer", id, "url", url, "name", name, "version", version, "mtls", pin != "")
 
 	r.startHeartbeat(id)
 	return nil
@@ -217,6 +240,44 @@ func (r *Registry) ResolveCaller(nodeID, remoteIP string) string {
 	return ""
 }
 
+// Transport is the transport every request to a peer must use: it dials
+// paired peers with mTLS, checking each one's pinned key, and legacy ones
+// as before.
+func (r *Registry) Transport() *http.Transport { return r.transport }
+
+// Identity is this node's own key, or nil if it has none.
+func (r *Registry) Identity() *peerauth.Identity { return r.identity }
+
+// PinForAddr returns the key pin of the paired peer at host:port addr.
+func (r *Registry) PinForAddr(addr string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.peers {
+		if p.Pin == "" {
+			continue
+		}
+		if a, ok := peerauth.AddrOf(p.URL); ok && a == addr {
+			return p.Pin, true
+		}
+	}
+	return "", false
+}
+
+// PeerByPin returns the peer whose key is pin.
+func (r *Registry) PeerByPin(pin string) (Peer, bool) {
+	if pin == "" {
+		return Peer{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.peers {
+		if p.Pin == pin {
+			return *p, true
+		}
+	}
+	return Peer{}, false
+}
+
 func (r *Registry) Get(id string) (Peer, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -225,6 +286,30 @@ func (r *Registry) Get(id string) (Peer, bool) {
 		return Peer{}, false
 	}
 	return *p, true
+}
+
+// SetTransports turns legacy (http) and paired (mTLS) peers on or off.
+// Peers of a turned-off kind become DISABLED; call before RunHeartbeat.
+func (r *Registry) SetTransports(httpPeers, mtlsPeers bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.httpOff, r.mtlsOff = !httpPeers, !mtlsPeers
+	for _, p := range r.peers {
+		if !r.enabledLocked(p) {
+			p.State = StateDisabled
+		}
+	}
+}
+
+// HTTPPeers and MTLSPeers report whether legacy and paired peers are on.
+func (r *Registry) HTTPPeers() bool { r.mu.RLock(); defer r.mu.RUnlock(); return !r.httpOff }
+func (r *Registry) MTLSPeers() bool { r.mu.RLock(); defer r.mu.RUnlock(); return !r.mtlsOff }
+
+func (r *Registry) enabledLocked(p *Peer) bool {
+	if p.Pin != "" {
+		return !r.mtlsOff
+	}
+	return !r.httpOff
 }
 
 // RunHeartbeat starts one heartbeat goroutine for every peer currently
@@ -241,6 +326,10 @@ func (r *Registry) RunHeartbeat(ctx context.Context) {
 // via RemovePeer.
 func (r *Registry) startHeartbeat(id string) {
 	r.mu.Lock()
+	if p, ok := r.peers[id]; ok && p.State == StateDisabled {
+		r.mu.Unlock()
+		return
+	}
 	if _, running := r.cancels[id]; running {
 		r.mu.Unlock()
 		return
@@ -286,8 +375,9 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	if ok {
 		url = p.URL
 	}
+	disabled := ok && p.State == StateDisabled
 	r.mu.RUnlock()
-	if !ok {
+	if !ok || disabled {
 		return
 	}
 

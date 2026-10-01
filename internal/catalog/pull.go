@@ -61,7 +61,7 @@ func (s PeerPullStats) Changes() int { return s.Upserts + s.Deletes + s.Swept }
 // pullPeers brings every given peer's mirror up to date, concurrently. A
 // failing peer is logged and skipped: its mirror just stays as of its last
 // successful pull.
-func pullPeers(ctx context.Context, db *sql.DB, list []peers.Peer, timeout time.Duration, selfID string) []PeerPullStats {
+func pullPeers(ctx context.Context, db *sql.DB, client *http.Client, list []peers.Peer, timeout time.Duration, selfID string) []PeerPullStats {
 	out := make([]PeerPullStats, len(list))
 	sem := make(chan struct{}, pullConcurrency)
 	var wg sync.WaitGroup
@@ -73,7 +73,7 @@ func pullPeers(ctx context.Context, db *sql.DB, list []peers.Peer, timeout time.
 			defer func() { <-sem }()
 			started := time.Now()
 			st := PeerPullStats{Peer: p.ID}
-			st.Err = pullPeer(ctx, db, p, timeout, selfID, &st)
+			st.Err = pullPeer(ctx, db, client, p, timeout, selfID, &st)
 			if st.Err == nil {
 				st.Err = markSynced(ctx, db, p.ID, time.Now())
 			}
@@ -105,7 +105,7 @@ func pullPeers(ctx context.Context, db *sql.DB, list []peers.Peer, timeout time.
 // .strm files with them) until the resync finished. Instead the resync is
 // written under a new generation and rows from older generations are swept
 // only once the feed is fully caught up.
-func pullPeer(ctx context.Context, db *sql.DB, p peers.Peer, timeout time.Duration, selfID string, st *PeerPullStats) error {
+func pullPeer(ctx context.Context, db *sql.DB, client *http.Client, p peers.Peer, timeout time.Duration, selfID string, st *PeerPullStats) error {
 	cur, err := loadCursor(ctx, db, p.ID)
 	if err != nil {
 		return err
@@ -115,11 +115,11 @@ func pullPeer(ctx context.Context, db *sql.DB, p peers.Peer, timeout time.Durati
 	for {
 		pageStarted := time.Now()
 		pageCtx, cancel := context.WithTimeout(ctx, timeout)
-		feed, err := fetchChanges(pageCtx, p.URL, selfID, cur.epoch, cur.rev, pullPageSize)
+		feed, err := fetchChanges(pageCtx, client, p.URL, selfID, cur.epoch, cur.rev, pullPageSize)
 		cancel()
 		if errors.Is(err, errFeedUnsupported) {
 			slog.Info("peer predates the change feed; fetching its full catalog (upgrade it for incremental sync)", "peer", p.ID)
-			return pullLegacy(ctx, db, p, cur, timeout, selfID, st)
+			return pullLegacy(ctx, db, client, p, cur, timeout, selfID, st)
 		}
 		if err != nil {
 			return err
@@ -168,10 +168,10 @@ func pullPeer(ctx context.Context, db *sql.DB, p peers.Peer, timeout time.Durati
 
 // pullLegacy fetches a pre-change-feed peer's whole catalog and replaces
 // its mirror with it, reusing the generation sweep so the swap is atomic.
-func pullLegacy(ctx context.Context, db *sql.DB, p peers.Peer, cur cursor, timeout time.Duration, selfID string, st *PeerPullStats) error {
+func pullLegacy(ctx context.Context, db *sql.DB, client *http.Client, p peers.Peer, cur cursor, timeout time.Duration, selfID string, st *PeerPullStats) error {
 	st.Legacy = true
 	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
-	entries, err := FetchPeerCatalog(fetchCtx, p.URL, selfID)
+	entries, err := FetchPeerCatalog(fetchCtx, client, p.URL, selfID)
 	cancel()
 	if err != nil {
 		return err
@@ -191,7 +191,7 @@ func pullLegacy(ctx context.Context, db *sql.DB, p peers.Peer, cur cursor, timeo
 	return nil
 }
 
-func fetchChanges(ctx context.Context, peerURL, selfID, epoch string, since int64, limit int) (Feed, error) {
+func fetchChanges(ctx context.Context, client *http.Client, peerURL, selfID, epoch string, since int64, limit int) (Feed, error) {
 	q := url.Values{
 		"epoch": {epoch},
 		"since": {strconv.FormatInt(since, 10)},
@@ -202,7 +202,7 @@ func fetchChanges(ctx context.Context, peerURL, selfID, epoch string, since int6
 		return Feed{}, err
 	}
 	req.Header.Set(peerHeader, selfID)
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return Feed{}, fmt.Errorf("fetching catalog changes from %s: %w", peerURL, err)
 	}

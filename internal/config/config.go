@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"jellysync/internal/logging"
+	"jellysync/internal/peerauth"
 )
 
 // defaultStreamBufferKB is the read/write buffer size used to relay
@@ -34,10 +35,24 @@ const defaultPeerFetchTimeoutSec = 60
 type Config struct {
 	NodeID     string
 	ListenAddr string
-	DBPath     string
-	Jellyfin   Jellyfin
-	Strm       Strm
-	Peers      []Peer
+	// PeerListenAddr is the mTLS peer port: the only one meant to be
+	// reachable from the internet (see internal/peerauth). Only listened on
+	// when MTLSPeers is set.
+	PeerListenAddr string
+	// HTTPPeers turns on legacy peers: the unauthenticated peer API on
+	// ListenAddr and peers added by URL (HTTP_PEERS, default true).
+	HTTPPeers bool
+	// MTLSPeers turns on peers paired by invite: the mTLS peer port,
+	// invites and pairing (MTLS_PEERS, default false).
+	MTLSPeers bool
+	// PublicURL is the canonical https://host:port peers reach
+	// PeerListenAddr at, written into invites. "" disables creating
+	// invites; the peer port still serves nodes already paired.
+	PublicURL string
+	DBPath    string
+	Jellyfin  Jellyfin
+	Strm      Strm
+	Peers     []Peer
 	// StreamBufferKB is the proxy relay's copy buffer size, in KiB.
 	StreamBufferKB int
 	// JellyfinTimeout bounds every request to the local Jellyfin instance.
@@ -67,13 +82,17 @@ type Peer struct {
 }
 
 // Load builds the Config from environment variables. jellysync always
-// listens on :8080 inside its container — expose it on a different host
-// port via docker-compose's port mapping instead of changing this.
+// listens on :8080 (dashboard, and legacy peers unless HTTP_PEERS=false;
+// plain HTTP for a VPN/LAN) and, with MTLS_PEERS=true, on :8443 (mTLS
+// peer port, meant to be public) inside its container — expose them on
+// different host ports via docker-compose's port mapping instead of
+// changing this.
 func Load() (*Config, error) {
 	cfg := &Config{
-		NodeID:     os.Getenv("NODE_ID"),
-		ListenAddr: ":8080",
-		DBPath:     envOr("DB_PATH", "./data/jellysync.db"),
+		NodeID:         os.Getenv("NODE_ID"),
+		ListenAddr:     ":8080",
+		PeerListenAddr: ":8443",
+		DBPath:         envOr("DB_PATH", "./data/jellysync.db"),
 		Jellyfin: Jellyfin{
 			URL:    os.Getenv("JELLYFIN_URL"),
 			APIKey: os.Getenv("JELLYFIN_API_KEY"),
@@ -117,6 +136,13 @@ func Load() (*Config, error) {
 	}
 	cfg.PeerFetchTimeout = time.Duration(peerFetchTimeoutSec) * time.Second
 
+	if cfg.HTTPPeers, err = envBoolOr("HTTP_PEERS", true); err != nil {
+		return nil, err
+	}
+	if cfg.MTLSPeers, err = envBoolOr("MTLS_PEERS", false); err != nil {
+		return nil, err
+	}
+
 	logLevel, err := logging.ParseLevel(os.Getenv("LOG_LEVEL"))
 	if err != nil {
 		return nil, err
@@ -137,6 +163,11 @@ func Load() (*Config, error) {
 	}
 	if cfg.Strm.BaseURL == "" {
 		return nil, fmt.Errorf("BASE_URL is required")
+	}
+	if raw := os.Getenv("PUBLIC_URL"); raw != "" {
+		if cfg.PublicURL, err = peerauth.CanonicalURL(raw); err != nil {
+			return nil, fmt.Errorf("PUBLIC_URL: %w", err)
+		}
 	}
 
 	return cfg, nil
@@ -171,6 +202,18 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBoolOr(k string, def bool) (bool, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s: invalid boolean %q (use true or false)", k, v)
+	}
+	return b, nil
 }
 
 func envIntOr(k string, def int) (int, error) {

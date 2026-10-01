@@ -10,6 +10,7 @@ package synctrigger
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -31,7 +32,7 @@ const (
 // triggerPull queues a pull-only sync (peer catalogs, no local refresh).
 // Both should be non-blocking. force only matters for a remote peerID.
 func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal, triggerPull func()) http.HandlerFunc {
-	client := &http.Client{Timeout: remoteHTTPTimeout}
+	client := &http.Client{Timeout: remoteHTTPTimeout, Transport: registry.Transport()}
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		peerID := r.PathValue("peerID")
@@ -48,6 +49,10 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 		if !found {
 			slog.Warn("remote sync requested for unknown peer", "peer", peerID)
 			http.Error(w, "unknown peer", http.StatusNotFound)
+			return
+		}
+		if p.State == peers.StateDisabled {
+			http.Error(w, "peer disabled: its transport is turned off on this node", http.StatusConflict)
 			return
 		}
 
@@ -73,7 +78,13 @@ func triggerRemote(client *http.Client, tracker *syncstatus.Tracker, p peers.Pee
 		resp, err = client.Do(req)
 		if err == nil {
 			resp.Body.Close()
-			if resp.StatusCode != http.StatusAccepted {
+			switch resp.StatusCode {
+			case http.StatusAccepted:
+			case http.StatusTooManyRequests:
+				// A paired peer limits how often each client may make it
+				// re-read its library (see app.forceRefreshEvery).
+				err = errors.New("peer refused: a refresh was requested too recently, try again later")
+			default:
 				err = fmt.Errorf("peer returned status %d", resp.StatusCode)
 			}
 		}

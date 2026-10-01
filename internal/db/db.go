@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS peers (
 	state        TEXT NOT NULL DEFAULT 'ONLINE',
 	last_seen_at INTEGER,
 	version      TEXT NOT NULL DEFAULT '',
-	name         TEXT NOT NULL DEFAULT ''
+	name         TEXT NOT NULL DEFAULT '',
+	-- pin is the key pin of a peer paired by invite (mTLS), '' for a
+	-- legacy peer added by URL. See internal/peerauth.
+	pin          TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS catalog_items (
@@ -87,6 +90,25 @@ CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- clients are nodes that redeemed one of this node's invites: their key
+-- (by pin) may read this node's catalog and stream from it over the peer
+-- port. This node never dials a client. See internal/peerauth.
+CREATE TABLE IF NOT EXISTS clients (
+	id           TEXT PRIMARY KEY,
+	pin          TEXT NOT NULL UNIQUE,
+	name         TEXT NOT NULL DEFAULT '',
+	created_at   INTEGER NOT NULL,
+	last_seen_at INTEGER
+);
+
+-- invites are issued, not yet redeemed invites, by their temporary key's
+-- pin. The private half only exists in the invite string.
+CREATE TABLE IF NOT EXISTS invites (
+	pin        TEXT PRIMARY KEY,
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
 `
 
 // seriesColumns are added to catalog_items via ALTER TABLE for databases
@@ -102,10 +124,12 @@ var seriesColumns = []string{
 }
 
 // peerColumns are added to peers via ALTER TABLE for databases created
-// before peer version tracking existed, same rationale as seriesColumns.
+// before peer version tracking (and later key pins) existed, same
+// rationale as seriesColumns.
 var peerColumns = []string{
 	"version TEXT NOT NULL DEFAULT ''",
 	"name TEXT NOT NULL DEFAULT ''",
+	"pin TEXT NOT NULL DEFAULT ''",
 }
 
 // Open creates the parent directory if needed, opens the SQLite file at

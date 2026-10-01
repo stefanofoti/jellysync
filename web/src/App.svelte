@@ -18,6 +18,17 @@
 
   let newPeerUrl = $state("");
   let addingPeer = $state(false);
+  let inviteText = $state("");
+  let redeeming = $state(false);
+
+  // The mTLS peer port: who may read this node's library (clients, who
+  // redeemed one of our invites) and the invites still pending.
+  let peerPort = $state(null); // {http_peers, mtls_peers, public_url, pin, invites_enabled}
+  let clients = $state([]);
+  let invites = $state([]);
+  let newInvite = $state(null); // {invite, expires_at} just created, shown once
+  let creatingInvite = $state(false);
+  let inviteCopied = $state(false);
 
   let settingsOpen = $state(false);
   const syncIntervalOptions = [0.5, 1, 2, 4, 6, 8, 12];
@@ -74,18 +85,24 @@
 
   async function refresh() {
     try {
-      const [healthRes, peersRes, statsRes, trafficRes, syncStatusRes] = await Promise.all([
+      const [healthRes, peersRes, statsRes, trafficRes, syncStatusRes, clientsRes, invitesRes, peerPortRes] = await Promise.all([
         fetch("/health"),
         fetch("/api/v1/peers"),
         fetch("/api/v1/stats"),
         fetch("/api/v1/traffic"),
         fetch("/api/v1/sync/status"),
+        fetch("/api/v1/clients"),
+        fetch("/api/v1/invites"),
+        fetch("/api/v1/peerport"),
       ]);
       health = await healthRes.json();
       peers = await peersRes.json();
       stats = await statsRes.json();
       traffic = await trafficRes.json();
       syncStatus = await syncStatusRes.json();
+      clients = await clientsRes.json();
+      invites = await invitesRes.json();
+      peerPort = await peerPortRes.json();
       syncFilterSources();
       await Promise.all([loadMovies(moviePage.offset), loadSeries(seriesPage.offset)]);
       error = "";
@@ -112,6 +129,73 @@
       }
     } finally {
       addingPeer = false;
+    }
+  }
+
+  async function redeemInvite() {
+    if (!inviteText.trim()) return;
+    redeeming = true;
+    try {
+      const res = await fetch("/api/v1/peers/redeem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ invite: inviteText.trim() }),
+      });
+      if (res.ok) {
+        inviteText = "";
+        error = "";
+        await refresh();
+      } else {
+        error = await res.text();
+      }
+    } finally {
+      redeeming = false;
+    }
+  }
+
+  async function createInvite() {
+    creatingInvite = true;
+    inviteCopied = false;
+    try {
+      const res = await fetch("/api/v1/invites", { method: "POST" });
+      if (res.ok) {
+        newInvite = await res.json();
+        error = "";
+        await refresh();
+      } else {
+        error = await res.text();
+      }
+    } finally {
+      creatingInvite = false;
+    }
+  }
+
+  async function copyInvite() {
+    try {
+      await navigator.clipboard.writeText(newInvite.invite);
+      inviteCopied = true;
+    } catch {
+      // Clipboard needs a secure context; the field stays selectable.
+    }
+  }
+
+  async function cancelInvite(pin) {
+    const res = await fetch(`/api/v1/invites/${encodeURIComponent(pin)}`, { method: "DELETE" });
+    if (res.ok) {
+      if (newInvite?.pin === pin) newInvite = null;
+      await refresh();
+    } else {
+      error = await res.text();
+    }
+  }
+
+  async function revokeClient(id) {
+    if (!confirm(`Revoke ${id}'s access to this library? It is cut off immediately and needs a new invite to come back.`)) return;
+    const res = await fetch(`/api/v1/clients/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (res.ok) {
+      await refresh();
+    } else {
+      error = await res.text();
     }
   }
 
@@ -289,11 +373,14 @@
   // or — for traffic from a caller we couldn't match — a raw node id or
   // "unknown") mapped to what the dashboard should show instead.
   let peersById = $derived(new Map(peers.map((p) => [p.id, p])));
+  let clientsById = $derived(new Map(clients.map((c) => [c.id, c])));
 
   function peerLabel(id) {
     if (id === "local") return "local";
     const peer = peersById.get(id);
     if (peer) return peer.name || shortId(peer.id);
+    const client = clientsById.get(id);
+    if (client) return client.name || client.id;
     return id;
   }
 
@@ -308,6 +395,7 @@
   function stateColor(state) {
     if (state === "ONLINE") return "bg-green-500/20 text-green-400";
     if (state === "DEGRADED") return "bg-yellow-500/20 text-yellow-400";
+    if (state === "DISABLED") return "bg-neutral-700 text-neutral-400";
     return "bg-red-500/20 text-red-400";
   }
 
@@ -620,6 +708,8 @@
                 <div class="truncate" title={peerId}>{peerLabel(peerId)}</div>
                 {#if peerIp(peerId)}
                   <div class="text-neutral-600 font-mono text-xs truncate">{peerIp(peerId)}</div>
+                {:else if clientsById.has(peerId) && !peersById.has(peerId)}
+                  <div class="text-neutral-600 text-xs">client</div>
                 {:else if !peersById.has(peerId)}
                   <div class="text-neutral-600 text-xs">not a configured peer</div>
                 {/if}
@@ -965,8 +1055,14 @@
                     <div class="text-neutral-500 text-xs truncate" title={lastSyncTitle(peer)}>{lastSyncLabel(peer)}</div>
                     <div class="text-neutral-700 font-mono text-xs truncate" title={peer.id}>{peer.id}</div>
                   </td>
-                  <td class="px-2 py-2 align-top">
+                  <td class="px-2 py-2 align-top text-right whitespace-nowrap">
                     <span class={`rounded px-2 py-0.5 text-xs ${stateColor(peer.state)}`}>{peer.state}</span>
+                    <div
+                      class={`text-xs mt-1 ${peer.mtls ? "text-green-500" : "text-yellow-600"}`}
+                      title={peer.mtls ? "Paired by invite: mutual TLS on its peer port" : "Added by URL: unauthenticated plain HTTP, private network only"}
+                    >
+                      {peer.mtls ? "mTLS" : "legacy"}
+                    </div>
                   </td>
                   <td class="px-2 py-2 text-right align-top">
                     <button
@@ -982,8 +1078,35 @@
               {/each}
             </tbody>
           </table>
+          {#if peerPort && !peerPort.mtls_peers}
+            <p class="text-xs text-neutral-500 pt-3">
+              Pairing by invite is off: set <span class="font-mono">MTLS_PEERS=true</span> to use it.
+            </p>
+          {/if}
           <form
             class="flex gap-2 pt-3"
+            onsubmit={(e) => { e.preventDefault(); redeemInvite(); }}
+          >
+            <input
+              class="flex-1 min-w-0 rounded bg-neutral-800 border border-neutral-700 px-2 py-1 text-sm font-mono"
+              placeholder="paste an invite: jellysync1:…"
+              bind:value={inviteText}
+            />
+            <button
+              class="rounded bg-neutral-700 hover:bg-neutral-600 disabled:opacity-50 px-3 py-1 text-sm"
+              type="submit"
+              disabled={redeeming || !peerPort?.mtls_peers}
+            >
+              {redeeming ? "pairing…" : "pair"}
+            </button>
+          </form>
+          <div class="text-neutral-600 text-xs pt-3">
+            {peerPort && !peerPort.http_peers
+              ? "Legacy peers by URL are off (HTTP_PEERS=false)"
+              : "Legacy: add by URL (plain HTTP, private network or VPN only)"}
+          </div>
+          <form
+            class="flex gap-2 pt-1"
             onsubmit={(e) => { e.preventDefault(); addPeer(); }}
           >
             <input
@@ -994,11 +1117,91 @@
             <button
               class="rounded bg-neutral-700 hover:bg-neutral-600 disabled:opacity-50 px-3 py-1 text-sm"
               type="submit"
-              disabled={addingPeer}
+              disabled={addingPeer || peerPort?.http_peers === false}
             >
               {addingPeer ? "checking…" : "add"}
             </button>
           </form>
+        </div>
+
+        <div class="px-4 py-4 border-b border-neutral-800">
+          <h3 class="text-xs font-medium text-neutral-500 uppercase mb-3">Who can access my library</h3>
+          {#if peerPort && !peerPort.mtls_peers}
+            <p class="text-xs text-neutral-500 mb-3">
+              Sharing by invite is off. Set <span class="font-mono">MTLS_PEERS=true</span> and
+              <span class="font-mono">PUBLIC_URL</span>, and publish the HTTPS port (8498), to create invites.
+            </p>
+          {:else if peerPort && !peerPort.invites_enabled}
+            <p class="text-xs text-neutral-500 mb-3">
+              Set <span class="font-mono">PUBLIC_URL</span> to the https:// address others reach this node's peer port at
+              to create invites.
+            </p>
+          {:else if peerPort}
+            <p class="text-xs text-neutral-500 mb-3 break-all">
+              Peer port: <span class="font-mono">{peerPort.public_url}</span>
+            </p>
+          {/if}
+          <table class="w-full text-sm">
+            <tbody>
+              {#each clients as client (client.id)}
+                <tr class="border-b border-neutral-800/60 last:border-0">
+                  <td class="px-2 py-2 max-w-0 w-full">
+                    <div class="truncate">{client.name || client.id}</div>
+                    <div class="text-neutral-500 text-xs truncate">
+                      {client.last_seen_at ? `seen ${formatAgo(client.last_seen_at)}` : "never connected"}
+                    </div>
+                    <div class="text-neutral-700 font-mono text-xs truncate" title={client.pin}>{client.id}</div>
+                  </td>
+                  <td class="px-2 py-2 text-right align-top">
+                    <button class="text-neutral-500 hover:text-red-400 text-xs" onclick={() => revokeClient(client.id)}>
+                      revoke
+                    </button>
+                  </td>
+                </tr>
+              {:else}
+                <tr><td class="px-2 py-3 text-neutral-500" colspan="2">Nobody has redeemed an invite yet.</td></tr>
+              {/each}
+              {#each invites as inv (inv.pin)}
+                <tr class="border-b border-neutral-800/60 last:border-0">
+                  <td class="px-2 py-2 max-w-0 w-full">
+                    <div class="text-neutral-400">pending invite</div>
+                    <div class="text-neutral-500 text-xs">expires {new Date(inv.expires_at).toLocaleString()}</div>
+                  </td>
+                  <td class="px-2 py-2 text-right align-top">
+                    <button class="text-neutral-500 hover:text-red-400 text-xs" onclick={() => cancelInvite(inv.pin)}>
+                      cancel
+                    </button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+          {#if newInvite}
+            <div class="pt-3 space-y-2">
+              <p class="text-xs text-yellow-500">
+                Send this privately: whoever holds it can pair once, until
+                {new Date(newInvite.expires_at).toLocaleString()}. It is not shown again.
+              </p>
+              <div class="flex gap-2">
+                <input
+                  class="flex-1 min-w-0 rounded bg-neutral-800 border border-neutral-700 px-2 py-1 text-xs font-mono"
+                  readonly
+                  value={newInvite.invite}
+                  onfocus={(e) => e.target.select()}
+                />
+                <button class="rounded bg-neutral-700 hover:bg-neutral-600 px-3 py-1 text-sm" onclick={copyInvite}>
+                  {inviteCopied ? "copied" : "copy"}
+                </button>
+              </div>
+            </div>
+          {/if}
+          <button
+            class="mt-3 rounded bg-neutral-700 hover:bg-neutral-600 disabled:opacity-50 px-3 py-1 text-sm"
+            onclick={createInvite}
+            disabled={creatingInvite || !peerPort?.invites_enabled}
+          >
+            {creatingInvite ? "creating…" : "create invite"}
+          </button>
         </div>
 
         <div class="px-4 py-4 space-y-4">

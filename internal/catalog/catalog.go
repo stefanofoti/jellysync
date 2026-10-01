@@ -18,13 +18,17 @@ import (
 
 	"jellysync/internal/jellyfin"
 	"jellysync/internal/logging"
+	"jellysync/internal/peerauth"
 	"jellysync/internal/peers"
 )
 
-// httpClient has no Timeout of its own: callers bound each request via the
-// context they pass in instead, so the deadline stays
-// configurable (see config.PeerFetchTimeout) rather than fixed here.
-var httpClient = &http.Client{}
+// peerClient is the client for requests to registry's peers. It has no
+// Timeout of its own: callers bound each request via the context they pass
+// in instead, so the deadline stays configurable (see
+// config.PeerFetchTimeout) rather than fixed here.
+func peerClient(registry *peers.Registry) *http.Client {
+	return &http.Client{Transport: registry.Transport()}
+}
 
 // Entry is the wire format exchanged over GET /api/v1/catalog.
 type Entry struct {
@@ -152,9 +156,12 @@ func Handler(ix *Index) http.HandlerFunc {
 }
 
 // caller identifies who made a peer-facing request, for logs: the
-// X-Jellysync-Peer header (the caller's NODE_ID) when sent, plus its
-// address.
+// authenticated caller on the peer port, else the X-Jellysync-Peer header
+// (the caller's NODE_ID) when sent, plus its address.
 func caller(r *http.Request) string {
+	if c, ok := peerauth.CallerFrom(r.Context()); ok {
+		return c.ID() + "@" + r.RemoteAddr
+	}
 	if id := r.Header.Get(peerHeader); id != "" {
 		return id + "@" + r.RemoteAddr
 	}
@@ -236,6 +243,7 @@ const notifyTimeout = 5 * time.Second
 // Best-effort and fire-and-forget: peers that miss it (or predate the
 // endpoint) still catch up on their own schedule.
 func NotifyPeers(registry *peers.Registry, selfID string) {
+	client := peerClient(registry)
 	for _, p := range registry.List() {
 		if p.State != peers.StateOnline {
 			slog.Debug("not notifying peer of catalog changes: not online", "peer", p.ID, "state", p.State)
@@ -249,7 +257,7 @@ func NotifyPeers(registry *peers.Registry, selfID string) {
 				return
 			}
 			req.Header.Set(peerHeader, selfID)
-			resp, err := httpClient.Do(req)
+			resp, err := client.Do(req)
 			if err != nil {
 				slog.Warn("notifying peer of catalog changes failed; it will catch up on its own schedule", "peer", p.ID, logging.Err(err))
 				return
@@ -260,6 +268,9 @@ func NotifyPeers(registry *peers.Registry, selfID string) {
 				slog.Debug("notified peer of catalog changes", "peer", p.ID)
 			case http.StatusNotFound, http.StatusMethodNotAllowed:
 				slog.Debug("peer predates change notifications; it will catch up on its own schedule", "peer", p.ID)
+			case http.StatusForbidden:
+				// One-way pairing: we're its client, it doesn't pull from us.
+				slog.Debug("peer does not pull from this node; not notifying it", "peer", p.ID)
 			default:
 				slog.Warn("notifying peer of catalog changes: unexpected status", "peer", p.ID, "status", resp.StatusCode)
 			}
@@ -286,13 +297,13 @@ func writeJSON(w http.ResponseWriter, r *http.Request, v any) {
 
 // FetchPeerCatalog fetches a peer node's whole catalog over the legacy
 // GET /api/v1/catalog endpoint, for peers that predate the change feed.
-func FetchPeerCatalog(ctx context.Context, peerURL, selfID string) ([]Entry, error) {
+func FetchPeerCatalog(ctx context.Context, client *http.Client, peerURL, selfID string) ([]Entry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, peerURL+"/api/v1/catalog", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set(peerHeader, selfID)
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching catalog from %s: %w", peerURL, err)
 	}
@@ -357,7 +368,7 @@ func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, 
 		}
 	}
 	st.PeersSkipped = len(all) - len(online)
-	st.Peers = pullPeers(ctx, db, online, peerFetchTimeout, selfID)
+	st.Peers = pullPeers(ctx, db, peerClient(registry), online, peerFetchTimeout, selfID)
 	if err := pruneRemovedPeers(ctx, db, all); err != nil {
 		return st, fmt.Errorf("pruning removed peers: %w", err)
 	}
@@ -429,7 +440,8 @@ func elect(ctx context.Context, db *sql.DB, onlinePeers map[string]bool) (map[st
 	for rows.Next() {
 		var raw string
 		var e Entry
-		if err := rows.Scan(&raw); err == nil {
+		err := rows.Scan(&raw)
+		if err == nil {
 			err = json.Unmarshal([]byte(raw), &e)
 		}
 		if err != nil {

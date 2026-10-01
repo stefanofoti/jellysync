@@ -12,11 +12,24 @@ services:
       - DB_PATH=/data/jellysync.db
       - OUTPUT_DIR=/media/synced
       - BASE_URL=http://jellysync:8080
+      # Optional: legacy peers over plain HTTP (port 8080, LAN/VPN only).
+      # On by default; set to false to turn them off.
+      # - HTTP_PEERS=true
+      # Optional: peers paired by invite, over HTTPS with mutual TLS (port
+      # 8498 below, safe to make public). Off by default.
+      # - MTLS_PEERS=true
+      # With MTLS_PEERS, to share your library by invite: the https://
+      # address others reach port 8498 at.
+      # - PUBLIC_URL=https://alice.duckdns.org:8498
       # DEBUG (default), INFO, WARN or ERROR.
       - LOG_LEVEL=DEBUG
     volumes:
       - ./jellysync/data:/data
       - ./jellysync/media/synced:/media/synced
     ports:
+      # Plain HTTP: dashboard and legacy peers. Keep it on your LAN/VPN.
       - "8098:8080"
+      # HTTPS with mutual TLS: peers paired by invite, when MTLS_PEERS=true.
+      # Safe to make public.
+      - "8498:8443"
     restart: unless-stopped
