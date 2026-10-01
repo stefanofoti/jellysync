@@ -1,0 +1,127 @@
+package peers
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"regexp"
+	"strings"
+
+	"github.com/google/uuid"
+)
+
+// reservedIDs can never be a peer id: "local" means "this node" in the
+// stream proxy and sync-trigger routes, and "unknown" is the owner key
+// catalog stats use for remote items with no elected peer.
+var reservedIDs = map[string]bool{"local": true, "unknown": true}
+
+var nonSlugChars = regexp.MustCompile(`[^a-z0-9_-]+`)
+
+// slug turns a peer's self-reported node name into something safe to use
+// both as a URL path segment and as a directory name under OUTPUT_DIR.
+func slug(name string) string {
+	s := nonSlugChars.ReplaceAllString(strings.ToLower(strings.TrimSpace(name)), "-")
+	return strings.Trim(s, "-_")
+}
+
+// idFor picks the registry id for a peer reporting name: its slug, or
+// slug_01, slug_02, ... if that is reserved or already in taken. A peer
+// reporting no usable name (a build too old to send node_id) gets a UUID.
+// Ids are assigned once and kept: a peer that later changes its NODE_ID
+// keeps its id, so its .strm files don't move again.
+func idFor(name string, taken func(string) bool) string {
+	base := slug(name)
+	if base == "" {
+		return uuid.NewString()
+	}
+	if !taken(base) && !reservedIDs[base] {
+		return base
+	}
+	for n := 1; ; n++ {
+		id := fmt.Sprintf("%s_%02d", base, n)
+		if !taken(id) {
+			return id
+		}
+	}
+}
+
+// NewID returns an unused registry id for a peer reporting name. It only
+// picks the id; callers then AddPeer with it.
+func (r *Registry) NewID(name string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return idFor(name, func(id string) bool { _, ok := r.peers[id]; return ok })
+}
+
+// peerIDTables are every table column holding a peer registry id, all
+// rewritten together when a peer's id changes.
+var peerIDTables = []struct{ table, column string }{
+	{"peers", "id"},
+	{"peer_catalog", "peer_id"},
+	{"peer_sync_state", "peer_id"},
+	{"peer_traffic", "peer_id"},
+	{"catalog_items", "primary_peer_id"},
+}
+
+// migrateUUIDIDs renames peers that still carry a generated UUID id (from
+// builds that assigned those) to a name-based id, once their name is
+// known. Peers are handled in the order they were added (rowid), so the
+// first of several same-named peers gets the plain name. The next
+// strm.Reconcile moves their .strm files to the new peer folder. A UUID
+// peer whose name isn't known yet is left alone and retried next boot.
+func migrateUUIDIDs(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT id, name FROM peers ORDER BY rowid`)
+	if err != nil {
+		return fmt.Errorf("loading peer ids: %w", err)
+	}
+	type peerRow struct{ id, name string }
+	var all []peerRow
+	taken := make(map[string]bool)
+	for rows.Next() {
+		var p peerRow
+		if err := rows.Scan(&p.id, &p.name); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning peer id: %w", err)
+		}
+		all = append(all, p)
+		taken[p.id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("loading peer ids: %w", err)
+	}
+
+	renames := make(map[string]string)
+	for _, p := range all {
+		if _, err := uuid.Parse(p.id); err != nil || slug(p.name) == "" {
+			continue
+		}
+		newID := idFor(p.name, func(id string) bool { return taken[id] })
+		taken[newID] = true
+		renames[p.id] = newID
+	}
+	if len(renames) == 0 {
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for oldID, newID := range renames {
+		for _, t := range peerIDTables {
+			if _, err := tx.ExecContext(ctx, `UPDATE `+t.table+` SET `+t.column+` = ? WHERE `+t.column+` = ?`, newID, oldID); err != nil {
+				return fmt.Errorf("renaming peer %s to %s in %s: %w", oldID, newID, t.table, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("renaming peers: %w", err)
+	}
+	for oldID, newID := range renames {
+		slog.Info("peer id renamed; its .strm files move at the next sync", "from", oldID, "to", newID)
+	}
+	return nil
+}

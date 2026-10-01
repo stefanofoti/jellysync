@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"jellysync/internal/logging"
 )
 
@@ -50,9 +48,9 @@ func ListHandler(registry *Registry, lastSync func(context.Context) (map[string]
 }
 
 // AddHandler serves POST /api/v1/peers with a {"url"} JSON body. The peer's
-// id is generated here (opaque, never user-supplied) and its display name
-// is read from the peer's own /health "node_id" — nothing about identity
-// comes from client input.
+// display name is read from its own /health "node_id", and its id is
+// derived from that name (see idFor) — nothing about identity comes from
+// client input.
 func AddHandler(registry *Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -76,7 +74,7 @@ func AddHandler(registry *Registry) http.HandlerFunc {
 			http.Error(w, "peer unreachable: "+err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
-		id := uuid.NewString()
+		id := registry.NewID(name)
 		if err := registry.AddPeer(ctx, id, body.URL, name, version); err != nil {
 			slog.Error("adding peer", "url", body.URL, logging.Err(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)

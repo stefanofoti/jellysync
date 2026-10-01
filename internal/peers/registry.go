@@ -81,6 +81,10 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer) (*Re
 		}
 	}
 
+	if err := migrateUUIDIDs(ctx, db); err != nil {
+		return nil, err
+	}
+
 	rows, err := db.QueryContext(ctx, `SELECT id, url, state, version, name FROM peers`)
 	if err != nil {
 		return nil, fmt.Errorf("loading peers: %w", err)
