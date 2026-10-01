@@ -82,13 +82,30 @@ func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]E
 	}()
 	cleanStrmDir := filepath.Clean(strmDir) + string(filepath.Separator)
 
-	entries := make([]Entry, 0, len(items))
+	isStrm := func(it jellyfin.CatalogItem) bool {
+		return (strmDir != "" && strings.HasPrefix(filepath.Clean(it.Path)+string(filepath.Separator), cleanStrmDir)) ||
+			strings.EqualFold(filepath.Ext(it.Path), ".strm")
+	}
+
+	// Series roots are folders, so neither check in isStrm catches them when
+	// Jellyfin sees the output dir under a different mount path. A root whose
+	// episodes are all jellysync's own redirects is one too: drop it, or it
+	// would win the election as "local" and be re-offered to peers.
+	seriesEps := make(map[string]int)  // series global ID -> episodes seen
+	seriesReal := make(map[string]int) // ... of which are real local media
 	for _, it := range items {
-		if strmDir != "" && strings.HasPrefix(filepath.Clean(it.Path)+string(filepath.Separator), cleanStrmDir) {
-			excluded++
+		if it.MediaType != "episode" {
 			continue
 		}
-		if strings.EqualFold(filepath.Ext(it.Path), ".strm") {
+		seriesEps[it.SeriesGlobalID]++
+		if !isStrm(it) {
+			seriesReal[it.SeriesGlobalID]++
+		}
+	}
+
+	entries := make([]Entry, 0, len(items))
+	for _, it := range items {
+		if isStrm(it) || (it.MediaType == "series" && seriesEps[it.GlobalID()] > 0 && seriesReal[it.GlobalID()] == 0) {
 			excluded++
 			continue
 		}

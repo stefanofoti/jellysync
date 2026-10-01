@@ -24,7 +24,8 @@ func Stats(ctx context.Context, db *sql.DB) ([]OwnerCounts, error) {
 		SELECT
 			CASE WHEN local THEN 'local' ELSE COALESCE(primary_peer_id, 'unknown') END AS owner,
 			media_type,
-			COUNT(*)
+			COUNT(*),
+			COUNT(DISTINCT `+seriesKeyExpr+`)
 		FROM catalog_items
 		GROUP BY owner, media_type
 	`)
@@ -37,8 +38,8 @@ func Stats(ctx context.Context, db *sql.DB) ([]OwnerCounts, error) {
 	order := make([]string, 0)
 	for rows.Next() {
 		var owner, mediaType string
-		var n int
-		if err := rows.Scan(&owner, &mediaType, &n); err != nil {
+		var n, distinctSeries int
+		if err := rows.Scan(&owner, &mediaType, &n, &distinctSeries); err != nil {
 			return nil, err
 		}
 		oc, ok := byOwner[owner]
@@ -50,10 +51,12 @@ func Stats(ctx context.Context, db *sql.DB) ([]OwnerCounts, error) {
 		switch mediaType {
 		case "movie":
 			oc.Movies = n
-		case "series":
-			oc.Series = n
 		case "episode":
 			oc.Episodes = n
+			// Series count = distinct series with episodes owned here, same
+			// grouping as the series tab; root rows alone can be owned by a
+			// different node than the episodes.
+			oc.Series = distinctSeries
 		}
 	}
 	if err := rows.Err(); err != nil {
