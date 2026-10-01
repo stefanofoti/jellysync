@@ -304,6 +304,7 @@ func (a *App) dashboardMux(streams, trigger, notify http.HandlerFunc) (http.Hand
 	mux.HandleFunc("DELETE /api/v1/clients/{clientID}", peerauth.RevokeClientHandler(a.auth))
 	mux.HandleFunc("GET /api/v1/items", catalog.ItemsHandler(a.db))
 	mux.HandleFunc("GET /api/v1/items/series/episodes", catalog.SeriesEpisodesHandler(a.db))
+	mux.HandleFunc("PUT /api/v1/items/hidden", catalog.HideHandler(a.db))
 	mux.HandleFunc("GET /api/v1/stats", catalog.StatsHandler(a.db))
 	mux.HandleFunc("GET /api/v1/traffic", metrics.TrafficHandler(a.collector, a.registry))
 	mux.HandleFunc("DELETE /api/v1/traffic", metrics.ResetHandler(a.collector))

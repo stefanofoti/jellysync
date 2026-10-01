@@ -34,7 +34,12 @@ func testDB(t *testing.T) *sql.DB {
 			series_name      TEXT NOT NULL DEFAULT '',
 			season_number    INTEGER NOT NULL DEFAULT 0,
 			episode_number   INTEGER NOT NULL DEFAULT 0,
+			hidden           INTEGER NOT NULL DEFAULT 0,
 			updated_at       INTEGER NOT NULL
+		);
+		CREATE TABLE hidden_items (
+			key        TEXT PRIMARY KEY,
+			created_at INTEGER NOT NULL
 		)
 	`)
 	if err != nil {
@@ -301,5 +306,41 @@ func TestItemsHandlerOwnersFilter(t *testing.T) {
 	page = getSeriesSummaryPage(t, db, "/api/v1/items?type=series&owners=")
 	if page.Total != 0 || len(page.Items) != 0 {
 		t.Errorf("series owners=: %+v", page)
+	}
+}
+
+func TestItemsHandlerReportsHiddenAndPending(t *testing.T) {
+	db := testDB(t)
+	seedMovies(t, db, 2)
+	seedSeries(t, db, "Show A", 2)
+
+	for _, key := range []string{"movie-00", "series:Show A"} {
+		if err := SetHidden(t.Context(), db, key, true); err != nil {
+			t.Fatalf("hiding %s: %v", key, err)
+		}
+	}
+	if err := SetHidden(t.Context(), db, "series:Show A-e00", true); err == nil {
+		t.Error("hiding a single episode succeeded, want an error")
+	}
+
+	page := getItemsPage(t, db, "/api/v1/items?type=movie")
+	got := map[string]itemDTO{}
+	for _, it := range page.Items {
+		got[it.GlobalID] = it
+	}
+	if m := got["movie-00"]; !m.Hidden || !m.HidePending {
+		t.Errorf("movie-00 = %+v, want hidden and pending", m)
+	}
+	if m := got["movie-01"]; m.Hidden || m.HidePending {
+		t.Errorf("movie-01 = %+v, want visible", m)
+	}
+
+	// Applied by a sync: no longer pending.
+	if _, err := db.Exec(`UPDATE catalog_items SET hidden = 1 WHERE global_id LIKE 'series:%'`); err != nil {
+		t.Fatal(err)
+	}
+	series := getSeriesSummaryPage(t, db, "/api/v1/items?type=series")
+	if s := series.Items[0]; !s.Hidden || s.HidePending {
+		t.Errorf("series = %+v, want hidden, not pending", s)
 	}
 }

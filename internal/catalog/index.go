@@ -67,15 +67,21 @@ type RefreshStats struct {
 	Added   int
 	Updated int
 	Removed int
-	Purged  int   // expired tombstones garbage-collected
-	Head    int64 // feed head after the refresh
+	// Hidden/Unhidden are items the user hid from or unhid for peers since
+	// the previous refresh (see hidden_items): peers see them removed/added.
+	Hidden   int
+	Unhidden int
+	Purged   int   // expired tombstones garbage-collected
+	Head     int64 // feed head after the refresh
 	// ListDuration is the Jellyfin listing alone; Duration the whole refresh.
 	ListDuration time.Duration
 	Duration     time.Duration
 }
 
 // Changed is how many items were added, updated or removed.
-func (s RefreshStats) Changed() int { return s.Added + s.Updated + s.Removed }
+func (s RefreshStats) Changed() int {
+	return s.Added + s.Updated + s.Removed + s.Hidden + s.Unhidden
+}
 
 // Refresh re-reads the local Jellyfin library and records every difference
 // from the previous snapshot as a new revision, all in one transaction.
@@ -101,6 +107,7 @@ func (ix *Index) EnsureIndexed(ctx context.Context) error {
 type indexedRow struct {
 	hash    string
 	deleted bool
+	hidden  bool
 }
 
 func (ix *Index) refreshLocked(ctx context.Context) (RefreshStats, error) {
@@ -123,15 +130,20 @@ func (ix *Index) refreshLocked(ctx context.Context) (RefreshStats, error) {
 	}
 	st.Total = len(current)
 
+	hidden, err := hiddenSet(ctx, ix.db)
+	if err != nil {
+		return st, err
+	}
+
 	existing := make(map[string]indexedRow)
-	rows, err := ix.db.QueryContext(ctx, `SELECT global_id, hash, deleted FROM local_catalog`)
+	rows, err := ix.db.QueryContext(ctx, `SELECT global_id, hash, deleted, hidden FROM local_catalog`)
 	if err != nil {
 		return st, err
 	}
 	for rows.Next() {
 		var id string
 		var r indexedRow
-		if err := rows.Scan(&id, &r.hash, &r.deleted); err != nil {
+		if err := rows.Scan(&id, &r.hash, &r.deleted, &r.hidden); err != nil {
 			rows.Close()
 			return st, err
 		}
@@ -167,23 +179,31 @@ func (ix *Index) refreshLocked(ctx context.Context) (RefreshStats, error) {
 				return err
 			}
 			hash := contentHash(raw)
+			isHid := isHidden(hidden, current[id])
 			old, ok := existing[id]
+			live := ok && !old.deleted
 			switch {
-			case ok && !old.deleted && old.hash == hash:
+			case live && old.hash == hash && old.hidden == isHid:
 				continue
-			case ok && !old.deleted:
+			case live && !old.hidden && isHid:
+				st.Hidden++
+			case live && old.hidden && !isHid:
+				st.Unhidden++
+			case live:
 				st.Updated++
 			default:
 				st.Added++
 			}
+			// A hidden row still gets a new rev, so peers following the feed
+			// receive it as a tombstone (see Changes).
 			head++
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO local_catalog (global_id, entry, hash, rev, deleted, updated_at)
-				VALUES (?, ?, ?, ?, 0, ?)
+				INSERT INTO local_catalog (global_id, entry, hash, rev, deleted, hidden, updated_at)
+				VALUES (?, ?, ?, ?, 0, ?, ?)
 				ON CONFLICT(global_id) DO UPDATE SET
 					entry = excluded.entry, hash = excluded.hash, rev = excluded.rev,
-					deleted = 0, updated_at = excluded.updated_at
-			`, id, string(raw), hash, head, now.Unix()); err != nil {
+					deleted = 0, hidden = excluded.hidden, updated_at = excluded.updated_at
+			`, id, string(raw), hash, head, isHid, now.Unix()); err != nil {
 				return fmt.Errorf("indexing %s: %w", id, err)
 			}
 		}
@@ -217,7 +237,7 @@ func (ix *Index) refreshLocked(ctx context.Context) (RefreshStats, error) {
 	st.Duration = time.Since(started)
 	slog.Debug("local catalog index refreshed",
 		"items", st.Total, "added", st.Added, "updated", st.Updated, "removed", st.Removed,
-		"tombstones_purged", st.Purged, "head", st.Head,
+		"hidden", st.Hidden, "unhidden", st.Unhidden, "tombstones_purged", st.Purged, "head", st.Head,
 		"jellyfin_listing", st.ListDuration.Round(time.Millisecond), "duration", st.Duration.Round(time.Millisecond))
 	return st, nil
 }
@@ -243,7 +263,8 @@ func gcTombstones(ctx context.Context, tx *sql.Tx, now time.Time) (int, error) {
 }
 
 // Change is one entry of the change feed: either the item's current wire
-// entry, or a tombstone (Deleted, Entry nil) for an item no longer offered.
+// entry, or a tombstone (Deleted, Entry nil) for an item no longer offered,
+// including one the user hid.
 type Change struct {
 	Rev      int64  `json:"rev"`
 	GlobalID string `json:"global_id"`
@@ -306,9 +327,10 @@ func (ix *Index) Changes(ctx context.Context, epoch string, since int64, limit i
 
 		// From scratch, tombstones are pointless: the client has nothing
 		// to delete yet (or sweeps what it had once the resync completes).
-		query := `SELECT rev, global_id, deleted, entry FROM local_catalog WHERE rev > ? ORDER BY rev LIMIT ?`
+		// A hidden row is served exactly like a removal.
+		query := `SELECT rev, global_id, deleted OR hidden, entry FROM local_catalog WHERE rev > ? ORDER BY rev LIMIT ?`
 		if since == 0 {
-			query = `SELECT rev, global_id, deleted, entry FROM local_catalog WHERE rev > ? AND deleted = 0 ORDER BY rev LIMIT ?`
+			query = `SELECT rev, global_id, 0, entry FROM local_catalog WHERE rev > ? AND deleted = 0 AND hidden = 0 ORDER BY rev LIMIT ?`
 		}
 		rows, err := tx.QueryContext(ctx, query, since, limit+1)
 		if err != nil {
@@ -346,10 +368,10 @@ func (ix *Index) Changes(ctx context.Context, epoch string, since int64, limit i
 	return feed, nil
 }
 
-// Entries returns every item currently in the index, for the legacy
-// full-catalog endpoint.
+// Entries returns every item currently offered to peers (not hidden), for
+// the legacy full-catalog endpoint.
 func (ix *Index) Entries(ctx context.Context) ([]Entry, error) {
-	rows, err := ix.db.QueryContext(ctx, `SELECT entry FROM local_catalog WHERE deleted = 0 ORDER BY global_id`)
+	rows, err := ix.db.QueryContext(ctx, `SELECT entry FROM local_catalog WHERE deleted = 0 AND hidden = 0 ORDER BY global_id`)
 	if err != nil {
 		return nil, err
 	}

@@ -14,7 +14,14 @@ const (
 )
 
 const itemColumns = `global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, strm_path,
-	       series_global_id, series_name, season_number, episode_number`
+	       series_global_id, series_name, season_number, episode_number,
+	       hidden, ` + hiddenWantedExpr
+
+// hiddenWantedExpr is whether the user currently wants a catalog_items row
+// hidden (an episode by its series), which the row's own hidden column only
+// reflects after the next sync.
+const hiddenWantedExpr = `EXISTS (SELECT 1 FROM hidden_items h WHERE h.key =
+	CASE WHEN media_type = 'episode' THEN ` + seriesKeyExpr + ` ELSE global_id END)`
 
 type itemDTO struct {
 	GlobalID       string `json:"global_id"`
@@ -27,6 +34,12 @@ type itemDTO struct {
 	SeriesName     string `json:"series_name,omitempty"`
 	SeasonNumber   int    `json:"season_number,omitempty"`
 	EpisodeNumber  int    `json:"episode_number,omitempty"`
+
+	// Hidden is whether the user hid this item (an episode: its series)
+	// from sync. HidePending means that choice isn't applied yet: it takes
+	// effect at the next sync.
+	Hidden      bool `json:"hidden"`
+	HidePending bool `json:"hide_pending,omitempty"`
 
 	// StreamPeerID/StreamItemID are the {peerID}/{itemID} pair to hit
 	// GET /api/v1/proxy/stream/{peerID}/{itemID} for this item directly —
@@ -59,6 +72,9 @@ type seriesSummaryDTO struct {
 	SeriesName string `json:"series_name"`
 	LocalCount int    `json:"local_count"`
 	TotalCount int    `json:"total_count"`
+	// Hidden/HidePending as on itemDTO, for the whole series.
+	Hidden      bool `json:"hidden"`
+	HidePending bool `json:"hide_pending,omitempty"`
 }
 
 type seriesSummaryPage struct {
@@ -78,11 +94,13 @@ func scanItemRows(rows *sql.Rows) ([]itemDTO, error) {
 	for rows.Next() {
 		var it itemDTO
 		var localInt int
+		var hiddenApplied bool
 		var localItemID, primaryPeerID, primaryItemID, strmPath sql.NullString
 		if err := rows.Scan(&it.GlobalID, &it.Name, &it.MediaType, &localInt, &localItemID, &primaryPeerID, &primaryItemID, &strmPath,
-			&it.SeriesGlobalID, &it.SeriesName, &it.SeasonNumber, &it.EpisodeNumber); err != nil {
+			&it.SeriesGlobalID, &it.SeriesName, &it.SeasonNumber, &it.EpisodeNumber, &hiddenApplied, &it.Hidden); err != nil {
 			return nil, err
 		}
+		it.HidePending = it.Hidden != hiddenApplied
 		it.Local = localInt != 0
 		it.PrimaryPeerID = primaryPeerID.String
 		it.StrmPath = strmPath.String
@@ -285,7 +303,8 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 
 	rows, err := db.QueryContext(r.Context(), `
-		SELECT `+seriesKeyExpr+` AS skey, MIN(series_name), SUM(local), COUNT(*)
+		SELECT `+seriesKeyExpr+` AS skey, MIN(series_name), SUM(local), COUNT(*),
+		       MAX(hidden), EXISTS (SELECT 1 FROM hidden_items h WHERE h.key = `+seriesKeyExpr+`)
 		FROM catalog_items
 		WHERE media_type = 'episode' AND `+ownerCond+`
 		GROUP BY skey
@@ -301,10 +320,12 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	items := make([]seriesSummaryDTO, 0)
 	for rows.Next() {
 		var it seriesSummaryDTO
-		if err := rows.Scan(&it.SeriesKey, &it.SeriesName, &it.LocalCount, &it.TotalCount); err != nil {
+		var hiddenApplied bool
+		if err := rows.Scan(&it.SeriesKey, &it.SeriesName, &it.LocalCount, &it.TotalCount, &hiddenApplied, &it.Hidden); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		it.HidePending = it.Hidden != hiddenApplied
 		items = append(items, it)
 	}
 	if err := rows.Err(); err != nil {

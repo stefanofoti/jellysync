@@ -69,6 +69,23 @@
     if (seq === seriesSeq) seriesPage = page;
   }
 
+  // Hides or unhides a movie (key = global_id) or a whole series (key =
+  // series_key) from sync, both directions. The backend applies it at the
+  // next sync; until then the row shows it as pending.
+  async function setHidden(key, hidden) {
+    try {
+      const res = await fetch("/api/v1/items/hidden", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, hidden }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await Promise.all([loadMovies(), loadSeries()]);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   function goToPage(type, offset) {
     if (type === "movies") loadMovies(offset);
     else loadSeries(offset);
@@ -560,6 +577,8 @@
       name: item.series_name || "Unknown series",
       localCount: item.local_count,
       totalCount: item.total_count,
+      hidden: item.hidden,
+      hidePending: item.hide_pending,
     })),
   );
 
@@ -605,6 +624,32 @@
     return () => clearInterval(interval);
   });
 </script>
+
+<!-- A hidden item is excluded from sync: not offered to peers if local, no
+     .strm file if remote. Changes apply at the next sync. -->
+{#snippet hiddenBadge(hidden, pending)}
+  {#if hidden || pending}
+    <span
+      class="rounded px-2 py-0.5 text-xs ml-1 bg-amber-500/20 text-amber-400 whitespace-nowrap"
+      title={pending ? "Applied at the next sync" : "Excluded from sync"}
+    >
+      {hidden ? "hidden" : "visible"}{pending ? " · next sync" : ""}
+    </span>
+  {/if}
+{/snippet}
+
+{#snippet hideButton(key, hidden)}
+  <button
+    class="text-neutral-500 hover:text-neutral-200 text-xs mr-2"
+    title={hidden ? "Include in sync again" : "Exclude from sync: not shared with peers if local, no .strm file if remote"}
+    onclick={(e) => {
+      e.stopPropagation();
+      setHidden(key, !hidden);
+    }}
+  >
+    {hidden ? "unhide" : "hide"}
+  </button>
+{/snippet}
 
 <div class="min-h-screen bg-neutral-950 text-neutral-200 px-3 py-4 sm:p-6 font-sans overflow-x-hidden">
   <div class="max-w-4xl mx-auto space-y-4 sm:space-y-6">
@@ -796,7 +841,7 @@
           {#if activeTab === "movies"}
             {#each movieRows as row (row.key)}
               <tr class="border-b border-neutral-800/60 last:border-0">
-                <td class="px-3 sm:px-4 py-2 break-words">{row.item.name}</td>
+                <td class={`px-3 sm:px-4 py-2 break-words ${row.item.hidden ? "text-neutral-500" : ""}`}>{row.item.name}</td>
                 <td class="px-4 py-2 text-neutral-500 hidden sm:table-cell">movie</td>
                 <td class="px-4 py-2">
                   {#if row.item.local}
@@ -806,8 +851,10 @@
                       remote · {peerLabel(row.item.primary_peer_id)}
                     </span>
                   {/if}
+                  {@render hiddenBadge(row.item.hidden, row.item.hide_pending)}
                 </td>
                 <td class="px-4 py-2 text-right whitespace-nowrap">
+                  {@render hideButton(row.item.global_id, row.item.hidden)}
                   {#if playable(row.item)}
                     <button class="text-neutral-500 hover:text-neutral-200 text-xs mr-2" onclick={() => testItem(row.item)}>
                       test
@@ -840,7 +887,7 @@
                 class="border-b border-neutral-800/60 last:border-0 cursor-pointer hover:bg-neutral-800/40"
                 onclick={() => toggleSeries(row.key)}
               >
-                <td class="px-3 sm:px-4 py-2 break-words">
+                <td class={`px-3 sm:px-4 py-2 break-words ${row.hidden ? "text-neutral-500" : ""}`}>
                   <span class="inline-block w-4 text-neutral-500">{expandedSeries.has(row.key) ? "▾" : "▸"}</span>
                   {row.name}
                 </td>
@@ -854,8 +901,11 @@
                     <span class="rounded px-2 py-0.5 text-xs bg-neutral-700 text-neutral-300">mixed</span>
                   {/if}
                   <span class="text-neutral-600 text-xs ml-1">{row.localCount}/{row.totalCount} local</span>
+                  {@render hiddenBadge(row.hidden, row.hidePending)}
                 </td>
-                <td class="px-4 py-2"></td>
+                <td class="px-4 py-2 text-right whitespace-nowrap">
+                  {@render hideButton(row.key, row.hidden)}
+                </td>
               </tr>
               {#if expandedSeries.has(row.key)}
                 {@const cacheEntry = seriesEpisodesCache.get(row.key)}

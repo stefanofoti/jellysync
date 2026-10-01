@@ -97,7 +97,7 @@ func urlFor(baseURL, peerID, itemID string) string {
 
 type row struct {
 	globalID, name, mediaType, peerID, itemID string
-	local                                     bool
+	local, hidden                             bool
 	oldPath                                   sql.NullString
 
 	seriesGlobalID, seriesName  string
@@ -108,14 +108,14 @@ type row struct {
 type Stats struct {
 	Written   int // .strm files created or rewritten
 	Moved     int // of Written, how many replaced a file at an old path
-	Removed   int // .strm files deleted (item now local or no longer offered)
+	Removed   int // .strm files deleted (item now local, hidden or no longer offered)
 	Unchanged int // wanted .strm files already up to date
 	Failed    int // files that couldn't be written or removed
 }
 
 // Reconcile writes a .strm file for every remote-elected catalog item that
 // doesn't already have one, removes .strm files for items that are now
-// local or no longer elected to any peer. It never asks Jellyfin to rescan.
+// local, hidden by the user, or no longer elected to any peer. It never asks Jellyfin to rescan.
 func Reconcile(ctx context.Context, db *sql.DB, cfg config.Strm) (Stats, error) {
 	var st Stats
 	for _, root := range []string{"movies", "series"} {
@@ -126,7 +126,7 @@ func Reconcile(ctx context.Context, db *sql.DB, cfg config.Strm) (Stats, error) 
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT global_id, name, media_type, local, primary_peer_id, primary_item_id, strm_path,
-		       series_global_id, series_name, season_number, episode_number
+		       series_global_id, series_name, season_number, episode_number, hidden
 		FROM catalog_items
 	`)
 	if err != nil {
@@ -139,7 +139,7 @@ func Reconcile(ctx context.Context, db *sql.DB, cfg config.Strm) (Stats, error) 
 		var localInt int
 		var peerID, itemID sql.NullString
 		if err := rows.Scan(&r.globalID, &r.name, &r.mediaType, &localInt, &peerID, &itemID, &r.oldPath,
-			&r.seriesGlobalID, &r.seriesName, &r.seasonNumber, &r.episodeNumber); err != nil {
+			&r.seriesGlobalID, &r.seriesName, &r.seasonNumber, &r.episodeNumber, &r.hidden); err != nil {
 			rows.Close()
 			return st, fmt.Errorf("scanning catalog_items: %w", err)
 		}
@@ -156,7 +156,7 @@ func Reconcile(ctx context.Context, db *sql.DB, cfg config.Strm) (Stats, error) 
 	for _, r := range all {
 		// Series-root items have no downloadable file — only their
 		// episodes are playable — so they never get a .strm of their own.
-		wantStrm := !r.local && r.peerID != "" && r.itemID != "" && r.mediaType != "series"
+		wantStrm := !r.local && !r.hidden && r.peerID != "" && r.itemID != "" && r.mediaType != "series"
 
 		if !wantStrm {
 			if r.oldPath.Valid {
@@ -164,7 +164,7 @@ func Reconcile(ctx context.Context, db *sql.DB, cfg config.Strm) (Stats, error) 
 					slog.Warn("removing .strm file", "path", r.oldPath.String, logging.Err(err))
 					st.Failed++
 				} else {
-					slog.Debug("removed .strm file", "path", r.oldPath.String, "item", r.globalID, "now_local", r.local)
+					slog.Debug("removed .strm file", "path", r.oldPath.String, "item", r.globalID, "now_local", r.local, "hidden", r.hidden)
 					st.Removed++
 				}
 				if err := clearPath(ctx, db, r.globalID); err != nil {

@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS catalog_items (
 	series_name      TEXT NOT NULL DEFAULT '',
 	season_number    INTEGER NOT NULL DEFAULT 0,
 	episode_number   INTEGER NOT NULL DEFAULT 0,
+	-- hidden: the item was excluded from sync (see hidden_items) as of the
+	-- last election. A hidden remote item gets no .strm file.
+	hidden           INTEGER NOT NULL DEFAULT 0,
 	updated_at       INTEGER NOT NULL
 );
 
@@ -53,6 +56,9 @@ CREATE TABLE IF NOT EXISTS local_catalog (
 	hash       TEXT NOT NULL,
 	rev        INTEGER NOT NULL,
 	deleted    INTEGER NOT NULL DEFAULT 0,
+	-- hidden: the item is excluded from sync (see hidden_items). It still
+	-- counts as local here, but the feed serves it to peers as a tombstone.
+	hidden     INTEGER NOT NULL DEFAULT 0,
 	updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS local_catalog_rev ON local_catalog (rev);
@@ -77,6 +83,17 @@ CREATE TABLE IF NOT EXISTS peer_sync_state (
 	gen       INTEGER NOT NULL DEFAULT 0,
 	resync    INTEGER NOT NULL DEFAULT 0,
 	synced_at INTEGER NOT NULL DEFAULT 0
+);
+
+-- hidden_items are items the user excluded from sync, by key: a movie's
+-- global_id, or a series key (series_global_id, else series_name) covering
+-- the series root and every episode. A hidden local item isn't offered to
+-- peers; a hidden remote item gets no .strm file. A key is dropped once no
+-- source (local library or any peer mirror) offers the item any more.
+-- See catalog.SetHidden.
+CREATE TABLE IF NOT EXISTS hidden_items (
+	key        TEXT PRIMARY KEY,
+	created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS peer_traffic (
@@ -112,8 +129,8 @@ CREATE TABLE IF NOT EXISTS invites (
 `
 
 // seriesColumns are added to catalog_items via ALTER TABLE for databases
-// created before series support existed: CREATE TABLE IF NOT EXISTS above
-// is a no-op against an already-existing table, and SQLite has no
+// created before series support (and later hiding) existed: CREATE TABLE IF
+// NOT EXISTS above is a no-op against an already-existing table, and SQLite has no
 // "ADD COLUMN IF NOT EXISTS", so each is added individually guarded by a
 // PRAGMA table_info check.
 var seriesColumns = []string{
@@ -121,6 +138,14 @@ var seriesColumns = []string{
 	"series_name TEXT NOT NULL DEFAULT ''",
 	"season_number INTEGER NOT NULL DEFAULT 0",
 	"episode_number INTEGER NOT NULL DEFAULT 0",
+	"hidden INTEGER NOT NULL DEFAULT 0",
+}
+
+// localCatalogColumns are added to local_catalog via ALTER TABLE for
+// databases created before hiding existed, same rationale as
+// seriesColumns.
+var localCatalogColumns = []string{
+	"hidden INTEGER NOT NULL DEFAULT 0",
 }
 
 // peerColumns are added to peers via ALTER TABLE for databases created
@@ -161,6 +186,10 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
 	if err := addMissingColumns(db, "peers", peerColumns); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating schema: %w", err)
+	}
+	if err := addMissingColumns(db, "local_catalog", localCatalogColumns); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}

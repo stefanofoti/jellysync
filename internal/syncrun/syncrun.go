@@ -118,7 +118,7 @@ func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, ix *catalog.
 	if st.LocalRefreshed {
 		log.Info("local catalog refreshed",
 			"items", st.Local.Total, "added", st.Local.Added, "updated", st.Local.Updated, "removed", st.Local.Removed,
-			"jellyfin_listing", st.Local.ListDuration.Round(time.Millisecond))
+			"hidden", st.Local.Hidden, "unhidden", st.Local.Unhidden, "jellyfin_listing", st.Local.ListDuration.Round(time.Millisecond))
 	}
 	if st.Local.Changed() > 0 {
 		log.Info("local catalog changed, notifying peers", "changes", st.Local.Changed())
@@ -139,7 +139,7 @@ func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, ix *catalog.
 	log.Info("catalog synced",
 		"peers_ok", peersOK, "peers_failed", peersFailed, "peers_skipped", st.PeersSkipped, "remote_changes", remoteChanges,
 		"items_local", st.Election.Local, "items_remote", st.Election.Remote, "items_changed", st.Election.Upserted,
-		"orphans_cleared", st.Election.OrphansCleared, "duration", time.Since(catalogStarted).Round(time.Millisecond))
+		"orphans_cleared", st.Election.OrphansCleared, "items_hidden", st.Election.Hidden, "duration", time.Since(catalogStarted).Round(time.Millisecond))
 
 	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageWriting, StartedAt: started})
 	strmStarted := time.Now()

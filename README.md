@@ -128,6 +128,15 @@ sequenceDiagram
 
 Each side only ever sends what changed since the last sync, from a saved snapshot — never a live listing of Alice's whole Jellyfin — so a routine sync with nothing new is one tiny request.
 
+#### Hiding titles
+
+Every movie and series in the dashboard has a **hide** button that leaves it out of syncing, in both directions:
+
+- **Your own title**: your peers no longer see it. It disappears from their libraries just as if you had deleted it, but it stays in yours.
+- **A peer's title**: no `.strm` file is written for it, and an existing one is removed.
+
+Hiding a series hides all of its episodes, including ones added later. A hide takes effect at the next sync (the dashboard shows it as pending until then), and **unhide** reverses it the same way. If a hidden title goes away on its own (you delete the file, or the peer stops offering it), the hide is forgotten, so the title shows up as normal if it ever comes back.
+
 ### Playback
 
 ```mermaid
