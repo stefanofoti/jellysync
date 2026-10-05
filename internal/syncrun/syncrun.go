@@ -41,6 +41,12 @@ const (
 	ReasonScheduled  = "scheduled"
 	ReasonManual     = "manual"
 	ReasonPeerNotify = "peer-notify"
+	// ReasonPeerState: a peer came back, or was unreachable long
+	// enough that its items are withdrawn (peers.Peer.Offering).
+	ReasonPeerState = "peer-state"
+	// ReasonSettings: the user changed a setting that affects the
+	// election (a peer's excluded folders).
+	ReasonSettings = "settings"
 )
 
 // Merge returns a request doing everything either one asks for.
@@ -139,7 +145,7 @@ func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, ix *catalog.
 	log.Info("catalog synced",
 		"peers_ok", peersOK, "peers_failed", peersFailed, "peers_skipped", st.PeersSkipped, "remote_changes", remoteChanges,
 		"items_local", st.Election.Local, "items_remote", st.Election.Remote, "items_changed", st.Election.Upserted,
-		"orphans_cleared", st.Election.OrphansCleared, "items_hidden", st.Election.Hidden, "duration", time.Since(catalogStarted).Round(time.Millisecond))
+		"orphans_cleared", st.Election.OrphansCleared, "items_hidden", st.Election.Hidden, "items_hidden_folder", st.Election.HiddenFolder, "duration", time.Since(catalogStarted).Round(time.Millisecond))
 
 	tracker.Set("local", syncstatus.Status{State: syncstatus.StateRunning, Stage: syncstatus.StageWriting, StartedAt: started})
 	strmStarted := time.Now()
@@ -149,7 +155,7 @@ func RunLocal(ctx context.Context, db *sql.DB, jf *jellyfin.Client, ix *catalog.
 	}
 	log.Info(".strm files reconciled",
 		"written", files.Written, "moved", files.Moved, "removed", files.Removed, "unchanged", files.Unchanged,
-		"failed", files.Failed, "duration", time.Since(strmStarted).Round(time.Millisecond))
+		"swept", files.Swept, "failed", files.Failed, "duration", time.Since(strmStarted).Round(time.Millisecond))
 
 	tracker.Set("local", syncstatus.Status{
 		State: syncstatus.StateSuccess, Percent: 100,

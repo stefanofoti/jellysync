@@ -5,10 +5,14 @@
 // is a remote sync: by default just a pull of the peers' cached catalogs
 // (scan 3), leaving that peer untouched; with force=true it first asks that
 // peer's node to refresh its own catalog from its Jellyfin, waits for it to
-// finish, then pulls. No path ever asks a Jellyfin to scan its files on disk.
+// finish, then pulls. With resync=true the pull re-downloads that peer's
+// whole catalog instead of only the changes since the last pull (see
+// catalog.RequestResync). No path ever asks a Jellyfin to scan its files on
+// disk.
 package synctrigger
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,16 +31,19 @@ const (
 	remotePollTimeout  = 30 * time.Minute
 )
 
-// Handler serves POST /api/v1/sync/trigger/{peerID}?force=true. triggerLocal
-// queues a sync that refreshes this node's own catalog from its Jellyfin;
-// triggerPull queues a pull-only sync (peer catalogs, no local refresh).
-// Both should be non-blocking. force only matters for a remote peerID.
-func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal, triggerPull func()) http.HandlerFunc {
+// Handler serves POST /api/v1/sync/trigger/{peerID}?force=true&resync=true.
+// triggerLocal queues a sync that refreshes this node's own catalog from its
+// Jellyfin; triggerPull queues a pull-only sync (peer catalogs, no local
+// refresh). Both should be non-blocking. requestResync marks a peer for a
+// full resync on its next pull. force and resync only matter for a remote
+// peerID.
+func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal, triggerPull func(), requestResync func(ctx context.Context, peerID string) error) http.HandlerFunc {
 	client := &http.Client{Timeout: remoteHTTPTimeout, Transport: registry.Transport()}
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		peerID := r.PathValue("peerID")
 		force := r.URL.Query().Get("force") == "true"
+		resync := r.URL.Query().Get("resync") == "true"
 
 		if peerID == "" || peerID == "local" {
 			slog.Info("local sync requested", "from", r.RemoteAddr)
@@ -56,6 +63,14 @@ func Handler(registry *peers.Registry, tracker *syncstatus.Tracker, triggerLocal
 			return
 		}
 
+		if resync {
+			if err := requestResync(r.Context(), p.ID); err != nil {
+				slog.Error("requesting full resync", "peer", p.ID, logging.Err(err))
+				http.Error(w, "requesting resync failed", http.StatusInternalServerError)
+				return
+			}
+			slog.Info("full resync of peer catalog requested", "peer", p.ID)
+		}
 		go triggerRemote(client, tracker, p, force, triggerPull)
 		w.WriteHeader(http.StatusAccepted)
 	}

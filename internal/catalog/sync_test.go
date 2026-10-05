@@ -24,6 +24,7 @@ import (
 type fakeJellyfin struct {
 	mu     sync.Mutex
 	movies map[string]string // tmdb id -> name
+	dirs   map[string]string // tmdb id -> folder of its file; default /media
 	calls  atomic.Int32
 }
 
@@ -39,8 +40,12 @@ func (f *fakeJellyfin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	items := make([]map[string]any, 0, len(f.movies))
 	for id, name := range f.movies {
+		dir := "/media"
+		if d, ok := f.dirs[id]; ok {
+			dir = d
+		}
 		items = append(items, map[string]any{
-			"Id": "jf-" + id, "Name": name, "Type": "Movie", "Path": "/media/" + id + ".mkv",
+			"Id": "jf-" + id, "Name": name, "Type": "Movie", "Path": dir + "/" + id + ".mkv",
 			"LocationType": "FileSystem", "ProviderIds": map[string]string{"Tmdb": id},
 		})
 	}
@@ -229,6 +234,37 @@ func TestSyncResyncsOnEpochChangeWithoutDroppingItems(t *testing.T) {
 	}
 }
 
+func TestRequestResyncRedownloadsWholeCatalog(t *testing.T) {
+	a := newNode(t, movies(3, 1))
+	b := newNode(t, nil)
+	reg := b.registry(t, config.Peer{ID: "a", URL: a.srv.URL})
+	mustSync(t, b, reg, true)
+
+	// A stray mirror row the delta feed would never correct: only a full
+	// resync drops it.
+	if _, err := b.db.Exec(`INSERT INTO peer_catalog (peer_id, global_id, entry, gen)
+		SELECT peer_id, 'tmdb:99', entry, gen FROM peer_catalog WHERE peer_id = 'a' LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequestResync(context.Background(), b.db, "a"); err != nil {
+		t.Fatal(err)
+	}
+	st := mustSync(t, b, reg, false)
+	if p := st.Peers[0]; !p.Resync || p.Upserts != 3 || p.Swept != 1 {
+		t.Errorf("requested resync stats = %+v, want resync with 3 upserts and 1 swept", p)
+	}
+	assertItems(t, b.items(t), "tmdb:1=a", "tmdb:2=a", "tmdb:3=a")
+	if got := b.mirrorSize(t, "a"); got != 3 {
+		t.Errorf("mirror has %d rows after resync, want 3", got)
+	}
+
+	// The request is consumed: the next pull is a delta again.
+	st = mustSync(t, b, reg, false)
+	if p := st.Peers[0]; p.Resync || p.Upserts != 0 {
+		t.Errorf("pull after resync = %+v, want an empty delta", p)
+	}
+}
+
 func TestSyncFallsBackToLegacyPeer(t *testing.T) {
 	a := newNode(t, movies(3, 1))
 	a.legacy = true
@@ -334,4 +370,35 @@ func TestLastSyncTimeOnlyMovesOnSuccess(t *testing.T) {
 	if got["a"].Unix() != 1000 {
 		t.Errorf("failed pull moved last sync time to %v (first success was %v)", got["a"], first)
 	}
+}
+
+// TestSyncKeepsUnreachablePeerItemsUntilWithdrawAfter checks that a peer
+// that's DEGRADED or OFFLINE keeps its items elected (from its last-known
+// mirror, without being pulled) until it's been unreachable for longer than
+// peers.WithdrawAfter.
+func TestSyncKeepsUnreachablePeerItemsUntilWithdrawAfter(t *testing.T) {
+	a := newNode(t, movies(2, 1))
+	b := newNode(t, nil)
+	cfg := config.Peer{ID: "a", URL: a.srv.URL}
+
+	mustSync(t, b, b.registry(t, cfg), true)
+	assertItems(t, b.items(t), "tmdb:1=a", "tmdb:2=a")
+
+	setPeer := func(state peers.State, lastSeen time.Time) *peers.Registry {
+		t.Helper()
+		if _, err := b.db.Exec(`UPDATE peers SET state = ?, last_seen_at = ? WHERE id = 'a'`, state, lastSeen.Unix()); err != nil {
+			t.Fatal(err)
+		}
+		return b.registry(t, cfg)
+	}
+
+	pulls := a.changes.Load()
+	st := mustSync(t, b, setPeer(peers.StateOffline, time.Now().Add(-time.Minute)), false)
+	assertItems(t, b.items(t), "tmdb:1=a", "tmdb:2=a")
+	if len(st.Peers) != 0 || a.changes.Load() != pulls {
+		t.Errorf("offline peer was pulled")
+	}
+
+	mustSync(t, b, setPeer(peers.StateOffline, time.Now().Add(-2*peers.WithdrawAfter)), false)
+	assertItems(t, b.items(t))
 }

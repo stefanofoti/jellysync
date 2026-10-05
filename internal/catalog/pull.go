@@ -39,6 +39,9 @@ type cursor struct {
 	rev    int64
 	gen    int64
 	resync bool
+	// requested: the user asked for a full resync (RequestResync). The
+	// pull starts from scratch and its first write clears the request.
+	requested bool
 }
 
 // PeerPullStats describes one peer's pull.
@@ -129,7 +132,10 @@ func pullPeer(ctx context.Context, db *sql.DB, client *http.Client, p peers.Peer
 
 		if feed.Reset || feed.Epoch != cur.epoch {
 			reason := "peer catalog history changed (e.g. its database was recreated)"
-			if cur.epoch == "" {
+			switch {
+			case cur.requested:
+				reason = "requested from the dashboard"
+			case cur.epoch == "":
 				reason = "first sync with this peer"
 			}
 			slog.Info("resyncing peer catalog from scratch", "peer", p.ID, "reason", reason, "our_since", cur.rev, "peer_head", feed.Head)
@@ -151,6 +157,8 @@ func pullPeer(ctx context.Context, db *sql.DB, client *http.Client, p peers.Peer
 		if err != nil {
 			return err
 		}
+		// The request is cleared now; one made from here on gets its own pull.
+		cur.requested = false
 		st.Upserts += ups
 		st.Deletes += dels
 		st.Swept += swept
@@ -182,7 +190,7 @@ func pullLegacy(ctx context.Context, db *sql.DB, client *http.Client, p peers.Pe
 		changes[i] = Change{GlobalID: entries[i].GlobalID, Entry: &entries[i]}
 	}
 	// An empty epoch guarantees a proper resync if the peer later upgrades.
-	next := cursor{gen: cur.gen + 1}
+	next := cursor{gen: cur.gen + 1, requested: cur.requested}
 	ups, _, swept, err := applyChanges(ctx, db, p.ID, next, changes, true)
 	if err != nil {
 		return err
@@ -223,15 +231,38 @@ func fetchChanges(ctx context.Context, client *http.Client, peerURL, selfID, epo
 
 func loadCursor(ctx context.Context, db *sql.DB, peerID string) (cursor, error) {
 	var c cursor
-	err := db.QueryRowContext(ctx, `SELECT epoch, rev, gen, resync FROM peer_sync_state WHERE peer_id = ?`, peerID).
-		Scan(&c.epoch, &c.rev, &c.gen, &c.resync)
+	err := db.QueryRowContext(ctx, `SELECT epoch, rev, gen, resync, resync_requested FROM peer_sync_state WHERE peer_id = ?`, peerID).
+		Scan(&c.epoch, &c.rev, &c.gen, &c.resync, &c.requested)
 	if err == sql.ErrNoRows {
 		return cursor{}, nil
 	}
 	if err != nil {
 		return cursor{}, fmt.Errorf("loading sync cursor for %s: %w", peerID, err)
 	}
+	if c.requested {
+		// Forget the position but keep gen: the resync is written under
+		// gen+1 and every older row is swept once it's caught up.
+		c.epoch, c.rev = "", 0
+	}
 	return c, nil
+}
+
+// RequestResync makes the next pull from peerID re-download its whole
+// catalog instead of the changes since the last one, as on first contact.
+// The mirror is kept meanwhile (see pullPeer), so no item disappears while
+// the resync runs. The request is stored, not applied: it survives a pull
+// already in progress and a restart, and only the pull that carries it out
+// clears it. It doesn't queue a sync itself.
+func RequestResync(ctx context.Context, db *sql.DB, peerID string) error {
+	mirrorMu.Lock()
+	defer mirrorMu.Unlock()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO peer_sync_state (peer_id, resync_requested) VALUES (?, 1)
+		ON CONFLICT(peer_id) DO UPDATE SET resync_requested = 1
+	`, peerID); err != nil {
+		return fmt.Errorf("requesting resync of %s: %w", peerID, err)
+	}
+	return nil
 }
 
 // applyChanges writes one page of changes plus the cursor it advances to,
@@ -250,8 +281,9 @@ func applyChanges(ctx context.Context, db *sql.DB, peerID string, cur cursor, ch
 			INSERT INTO peer_sync_state (peer_id, epoch, rev, gen, resync)
 			VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT(peer_id) DO UPDATE SET
-				epoch = excluded.epoch, rev = excluded.rev, gen = excluded.gen, resync = excluded.resync
-		`, peerID, cur.epoch, cur.rev, cur.gen, cur.resync); err != nil {
+				epoch = excluded.epoch, rev = excluded.rev, gen = excluded.gen, resync = excluded.resync,
+				resync_requested = CASE WHEN ? THEN 0 ELSE resync_requested END
+		`, peerID, cur.epoch, cur.rev, cur.gen, cur.resync, cur.requested); err != nil {
 			return fmt.Errorf("saving sync cursor: %w", err)
 		}
 		for _, c := range changes {
@@ -321,8 +353,8 @@ func LastSyncTimes(ctx context.Context, db *sql.DB) (map[string]time.Time, error
 	return out, rows.Err()
 }
 
-// pruneRemovedPeers drops mirrors and cursors of peers no longer in the
-// registry.
+// pruneRemovedPeers drops mirrors, cursors and folder exclusions of peers
+// no longer in the registry.
 func pruneRemovedPeers(ctx context.Context, db *sql.DB, known []peers.Peer) error {
 	ids := make([]any, 0, len(known))
 	placeholders := ""
@@ -341,6 +373,9 @@ func pruneRemovedPeers(ctx context.Context, db *sql.DB, known []peers.Peer) erro
 	defer mirrorMu.Unlock()
 	return withTx(ctx, db, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM peer_sync_state WHERE `+cond, ids...); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM peer_excluded_folders WHERE `+cond, ids...); err != nil {
 			return err
 		}
 		res, err := tx.ExecContext(ctx, `DELETE FROM peer_catalog WHERE `+cond, ids...)

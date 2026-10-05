@@ -1,4 +1,7 @@
 <script>
+  import ItemMenu from "./ItemMenu.svelte";
+  import ItemInfoModal from "./ItemInfoModal.svelte";
+
   let health = $state(null);
   let peers = $state([]);
   let stats = $state([]);
@@ -34,9 +37,14 @@
   const syncIntervalOptions = [0.5, 1, 2, 4, 6, 8, 12];
   let syncIntervalHours = $state(2);
   let savingInterval = $state(false);
+  // Per peer: folders on its filesystem whose items aren't taken from it.
+  let excludedFolders = $state({}); // peer id -> [folder]
+  let newFolder = $state({}); // peer id -> text being typed
+  let folderErrors = $state({}); // peer id -> last save error
   let syncStatus = $state({}); // peer id ("local" included) -> {state, percent, started_at, finished_at, error}
   let triggering = $state(new Set()); // scopes currently mid-request: "local" | "remote" | "both"
   let forceScan = $state(false); // remote sync only: first ask the peer to refresh its catalog from its own Jellyfin, instead of pulling its cached one
+  let fullResync = $state(false); // remote sync only: re-download each peer's whole catalog instead of the changes since the last pull
 
   // Source filtering happens server-side (the `owners` param), before
   // pagination, so every page is full and the series tab is filtered too —
@@ -243,9 +251,48 @@
       if (!res.ok) throw new Error(await res.text());
       const settings = await res.json();
       syncIntervalHours = Math.round((settings.sync_interval_seconds / 3600) * 100) / 100;
+      const lists = await Promise.all(
+        peers.map(async (p) => {
+          const r = await fetch(`/api/v1/peers/${encodeURIComponent(p.id)}/excluded-folders`);
+          if (!r.ok) throw new Error(await r.text());
+          return [p.id, (await r.json()).folders];
+        }),
+      );
+      excludedFolders = Object.fromEntries(lists);
     } catch (e) {
       error = String(e);
     }
+  }
+
+  // Replaces a peer's excluded folders. The backend normalizes them and
+  // runs a sync right away, so matching items turn "hidden (folder)".
+  async function saveFolders(peerId, folders) {
+    try {
+      const res = await fetch(`/api/v1/peers/${encodeURIComponent(peerId)}/excluded-folders`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folders }),
+      });
+      if (!res.ok) throw new Error((await res.text()).trim());
+      excludedFolders = { ...excludedFolders, [peerId]: (await res.json()).folders };
+      folderErrors = { ...folderErrors, [peerId]: "" };
+      return true;
+    } catch (e) {
+      folderErrors = { ...folderErrors, [peerId]: String(e.message || e) };
+      return false;
+    }
+  }
+
+  async function addFolder(peerId) {
+    const folder = (newFolder[peerId] || "").trim();
+    if (!folder) return;
+    if (await saveFolders(peerId, [...(excludedFolders[peerId] || []), folder])) {
+      newFolder = { ...newFolder, [peerId]: "" };
+    }
+  }
+
+  function removeFolder(peerId, folder) {
+    saveFolders(peerId, (excludedFolders[peerId] || []).filter((f) => f !== folder));
   }
 
   async function saveInterval() {
@@ -277,7 +324,10 @@
 
     triggering = new Set([...triggering, scope]);
     try {
-      const suffix = forceScan ? "?force=true" : "";
+      const params = new URLSearchParams();
+      if (forceScan) params.set("force", "true");
+      if (fullResync) params.set("resync", "true");
+      const suffix = params.size ? `?${params}` : "";
       await Promise.all(
         targets.map((id) => fetch(`/api/v1/sync/trigger/${encodeURIComponent(id)}${suffix}`, { method: "POST" })),
       );
@@ -579,6 +629,8 @@
       totalCount: item.total_count,
       hidden: item.hidden,
       hidePending: item.hide_pending,
+      hiddenFolder: item.hidden_folder,
+      folderHiddenCount: item.folder_hidden_count || 0,
     })),
   );
 
@@ -612,6 +664,45 @@
     playingKey = playingKey === item.global_id ? null : item.global_id;
   }
 
+  // ---- Per-item "…" menu + info modal --------------------------------
+  let infoTarget = $state(null); // { kind: "item", item } | { kind: "series", row }
+
+  // Menu actions for a movie or episode. hideKey is the key hiding acts on
+  // (a movie's global_id); episodes pass none, since only a whole series
+  // can be hidden.
+  function itemActions(item, hideKey = null) {
+    const actions = [];
+    if (hideKey) {
+      actions.push({
+        label: item.hidden ? "Unhide" : "Hide",
+        disabled: item.hidden_folder,
+        title: item.hidden_folder
+          ? "Excluded by a folder rule for its peer (Settings → Peers): can't be unhidden here"
+          : item.hidden
+            ? "Include in sync again"
+            : "Exclude from sync: not shared with peers if local, no .strm file if remote",
+        onclick: () => setHidden(hideKey, !item.hidden),
+      });
+    }
+    if (playable(item)) {
+      actions.push({ label: "Test", title: "Fetch the first bytes through the proxy", onclick: () => testItem(item) });
+      actions.push({ label: playingKey === item.global_id ? "Close player" : "Play", onclick: () => togglePlayer(item) });
+    }
+    actions.push({ label: "Info", onclick: () => (infoTarget = { kind: "item", item }) });
+    return actions;
+  }
+
+  function seriesActions(row) {
+    return [
+      {
+        label: row.hidden ? "Unhide" : "Hide",
+        title: row.hidden ? "Include in sync again" : "Exclude the whole series from sync",
+        onclick: () => setHidden(row.key, !row.hidden),
+      },
+      { label: "Info", onclick: () => (infoTarget = { kind: "series", row }) },
+    ];
+  }
+
   function testBadgeColor(status) {
     if (status === "ok") return "text-green-400";
     if (status === "fail") return "text-red-400";
@@ -627,7 +718,15 @@
 
 <!-- A hidden item is excluded from sync: not offered to peers if local, no
      .strm file if remote. Changes apply at the next sync. -->
-{#snippet hiddenBadge(hidden, pending)}
+{#snippet hiddenBadge(hidden, pending, folderCount = 0, all = false)}
+  {#if folderCount > 0}
+    <span
+      class="rounded px-2 py-0.5 text-xs ml-1 bg-amber-500/20 text-amber-400 whitespace-nowrap"
+      title="Excluded by a folder rule for its peer (Settings → Peers): no .strm file, can't be unhidden here"
+    >
+      {all ? "" : `${folderCount} `}hidden (folder)
+    </span>
+  {/if}
   {#if hidden || pending}
     <span
       class="rounded px-2 py-0.5 text-xs ml-1 bg-amber-500/20 text-amber-400 whitespace-nowrap"
@@ -638,17 +737,27 @@
   {/if}
 {/snippet}
 
-{#snippet hideButton(key, hidden)}
-  <button
-    class="text-neutral-500 hover:text-neutral-200 text-xs mr-2"
-    title={hidden ? "Include in sync again" : "Exclude from sync: not shared with peers if local, no .strm file if remote"}
-    onclick={(e) => {
-      e.stopPropagation();
-      setHidden(key, !hidden);
-    }}
-  >
-    {hidden ? "unhide" : "hide"}
-  </button>
+<!-- The file as its owner's Jellyfin reports it: on this node if local,
+     on the peer's filesystem if remote. Absent for peers too old to send it. -->
+{#snippet pathLine(item)}
+  {#if item.path}
+    <div
+      class="text-neutral-600 font-mono text-xs truncate"
+      title={item.local ? item.path : `${item.path} (path on ${peerLabel(item.primary_peer_id)})`}
+    >
+      {item.path}
+    </div>
+  {/if}
+{/snippet}
+
+
+<!-- Outcome of the menu's "Test", next to the menu so it stays visible. -->
+{#snippet testBadge(item)}
+  {#if testResults[item.global_id]}
+    <span class={`text-xs mr-1 ${testBadgeColor(testResults[item.global_id].status)}`}>
+      {testResults[item.global_id].status === "testing" ? "…" : testResults[item.global_id].detail}
+    </span>
+  {/if}
 {/snippet}
 
 <div class="min-h-screen bg-neutral-950 text-neutral-200 px-3 py-4 sm:p-6 font-sans overflow-x-hidden">
@@ -841,7 +950,10 @@
           {#if activeTab === "movies"}
             {#each movieRows as row (row.key)}
               <tr class="border-b border-neutral-800/60 last:border-0">
-                <td class={`px-3 sm:px-4 py-2 break-words ${row.item.hidden ? "text-neutral-500" : ""}`}>{row.item.name}</td>
+                <td class={`px-3 sm:px-4 py-2 break-words max-w-0 w-full ${row.item.hidden || row.item.hidden_folder ? "text-neutral-500" : ""}`}>
+                  {row.item.name}
+                  {@render pathLine(row.item)}
+                </td>
                 <td class="px-4 py-2 text-neutral-500 hidden sm:table-cell">movie</td>
                 <td class="px-4 py-2">
                   {#if row.item.local}
@@ -851,23 +963,11 @@
                       remote · {peerLabel(row.item.primary_peer_id)}
                     </span>
                   {/if}
-                  {@render hiddenBadge(row.item.hidden, row.item.hide_pending)}
+                  {@render hiddenBadge(row.item.hidden, row.item.hide_pending, row.item.hidden_folder ? 1 : 0, true)}
                 </td>
-                <td class="px-4 py-2 text-right whitespace-nowrap">
-                  {@render hideButton(row.item.global_id, row.item.hidden)}
-                  {#if playable(row.item)}
-                    <button class="text-neutral-500 hover:text-neutral-200 text-xs mr-2" onclick={() => testItem(row.item)}>
-                      test
-                    </button>
-                    {#if testResults[row.item.global_id]}
-                      <span class={`text-xs mr-2 ${testBadgeColor(testResults[row.item.global_id].status)}`}>
-                        {testResults[row.item.global_id].status === "testing" ? "…" : testResults[row.item.global_id].detail}
-                      </span>
-                    {/if}
-                    <button class="text-neutral-500 hover:text-neutral-200 text-xs" onclick={() => togglePlayer(row.item)}>
-                      {playingKey === row.item.global_id ? "close" : "play"}
-                    </button>
-                  {/if}
+                <td class="px-2 sm:px-4 py-2 text-right whitespace-nowrap">
+                  {@render testBadge(row.item)}
+                  <ItemMenu label={`Actions for ${row.item.name}`} actions={itemActions(row.item, row.item.global_id)} />
                 </td>
               </tr>
               {#if playingKey === row.item.global_id}
@@ -887,7 +987,7 @@
                 class="border-b border-neutral-800/60 last:border-0 cursor-pointer hover:bg-neutral-800/40"
                 onclick={() => toggleSeries(row.key)}
               >
-                <td class={`px-3 sm:px-4 py-2 break-words ${row.hidden ? "text-neutral-500" : ""}`}>
+                <td class={`px-3 sm:px-4 py-2 break-words ${row.hidden || row.hiddenFolder ? "text-neutral-500" : ""}`}>
                   <span class="inline-block w-4 text-neutral-500">{expandedSeries.has(row.key) ? "▾" : "▸"}</span>
                   {row.name}
                 </td>
@@ -901,10 +1001,10 @@
                     <span class="rounded px-2 py-0.5 text-xs bg-neutral-700 text-neutral-300">mixed</span>
                   {/if}
                   <span class="text-neutral-600 text-xs ml-1">{row.localCount}/{row.totalCount} local</span>
-                  {@render hiddenBadge(row.hidden, row.hidePending)}
+                  {@render hiddenBadge(row.hidden, row.hidePending, row.folderHiddenCount, row.hiddenFolder)}
                 </td>
-                <td class="px-4 py-2 text-right whitespace-nowrap">
-                  {@render hideButton(row.key, row.hidden)}
+                <td class="px-2 sm:px-4 py-2 text-right whitespace-nowrap">
+                  <ItemMenu label={`Actions for ${row.name}`} actions={seriesActions(row)} />
                 </td>
               </tr>
               {#if expandedSeries.has(row.key)}
@@ -924,7 +1024,10 @@
                   </tr>
                   {#each season.episodes as episode (episode.global_id)}
                     <tr class="border-b border-neutral-800/60 last:border-0">
-                      <td class="px-3 sm:px-4 py-2 pl-8 sm:pl-14 text-neutral-300 break-words">{episodeLabel(episode)}</td>
+                      <td class={`px-3 sm:px-4 py-2 pl-8 sm:pl-14 break-words max-w-0 w-full ${episode.hidden_folder ? "text-neutral-500" : "text-neutral-300"}`}>
+                        {episodeLabel(episode)}
+                        {@render pathLine(episode)}
+                      </td>
                       <td class="px-4 py-2 text-neutral-500 hidden sm:table-cell">episode</td>
                       <td class="px-4 py-2">
                         {#if episode.local}
@@ -934,21 +1037,11 @@
                             remote · {peerLabel(episode.primary_peer_id)}
                           </span>
                         {/if}
+                        {@render hiddenBadge(false, false, episode.hidden_folder ? 1 : 0, true)}
                       </td>
-                      <td class="px-4 py-2 text-right whitespace-nowrap">
-                        {#if playable(episode)}
-                          <button class="text-neutral-500 hover:text-neutral-200 text-xs mr-2" onclick={() => testItem(episode)}>
-                            test
-                          </button>
-                          {#if testResults[episode.global_id]}
-                            <span class={`text-xs mr-2 ${testBadgeColor(testResults[episode.global_id].status)}`}>
-                              {testResults[episode.global_id].status === "testing" ? "…" : testResults[episode.global_id].detail}
-                            </span>
-                          {/if}
-                          <button class="text-neutral-500 hover:text-neutral-200 text-xs" onclick={() => togglePlayer(episode)}>
-                            {playingKey === episode.global_id ? "close" : "play"}
-                          </button>
-                        {/if}
+                      <td class="px-2 sm:px-4 py-2 text-right whitespace-nowrap">
+                        {@render testBadge(episode)}
+                        <ItemMenu label={`Actions for ${episodeLabel(episode)}`} actions={itemActions(episode)} />
                       </td>
                     </tr>
                     {#if playingKey === episode.global_id}
@@ -1016,6 +1109,10 @@
     </section>
   </div>
 
+  {#if infoTarget}
+    <ItemInfoModal target={infoTarget} {peerLabel} onclose={() => (infoTarget = null)} />
+  {/if}
+
   {#if settingsOpen}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1060,6 +1157,10 @@
           <label class="flex items-center gap-2 text-sm text-neutral-400">
             <input type="checkbox" bind:checked={forceScan} />
             force peer to refresh its catalog
+          </label>
+          <label class="flex items-center gap-2 text-sm text-neutral-400">
+            <input type="checkbox" bind:checked={fullResync} />
+            full resync: re-download peer catalogs instead of only changes
           </label>
 
           <div class="space-y-2">
@@ -1121,6 +1222,37 @@
                     >
                       remove
                     </button>
+                  </td>
+                </tr>
+                <tr class="border-b border-neutral-800/60 last:border-0">
+                  <td class="px-2 pb-3" colspan="3">
+                    <div class="text-xs text-neutral-500 mb-1" title="Folders on this peer's filesystem: its items under them get no .strm file and show as hidden (folder)">
+                      Excluded folders
+                    </div>
+                    {#each excludedFolders[peer.id] || [] as folder (folder)}
+                      <div class="flex items-center gap-2 text-xs">
+                        <span class="font-mono text-neutral-300 truncate min-w-0" title={folder}>{folder}</span>
+                        <button class="text-neutral-500 hover:text-red-400" title="Stop excluding this folder" onclick={() => removeFolder(peer.id, folder)}>×</button>
+                      </div>
+                    {/each}
+                    <form
+                      class="flex gap-2 mt-1"
+                      onsubmit={(e) => {
+                        e.preventDefault();
+                        addFolder(peer.id);
+                      }}
+                    >
+                      <input
+                        class="flex-1 min-w-0 rounded bg-neutral-950 border border-neutral-700 px-2 py-1 text-xs font-mono"
+                        placeholder="/Data/Media/Remote"
+                        value={newFolder[peer.id] || ""}
+                        oninput={(e) => (newFolder = { ...newFolder, [peer.id]: e.currentTarget.value })}
+                      />
+                      <button class="text-neutral-400 hover:text-neutral-200 text-xs" type="submit">add</button>
+                    </form>
+                    {#if folderErrors[peer.id]}
+                      <div class="text-xs text-red-400 mt-1">{folderErrors[peer.id]}</div>
+                    {/if}
                   </td>
                 </tr>
               {:else}

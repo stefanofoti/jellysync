@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS catalog_items (
 	-- hidden: the item was excluded from sync (see hidden_items) as of the
 	-- last election. A hidden remote item gets no .strm file.
 	hidden           INTEGER NOT NULL DEFAULT 0,
+	-- path: the elected copy's file path, as its owner's Jellyfin reports it.
+	path             TEXT NOT NULL DEFAULT '',
+	-- hidden_folder: every offer of this remote item lies under a folder
+	-- excluded for its peer (peer_excluded_folders). No .strm, and unlike
+	-- hidden it can't be undone per item.
+	hidden_folder    INTEGER NOT NULL DEFAULT 0,
 	updated_at       INTEGER NOT NULL
 );
 
@@ -76,13 +82,16 @@ CREATE TABLE IF NOT EXISTS peer_catalog (
 
 -- peer_sync_state is the per-peer change-feed cursor: which of the peer's
 -- catalog epochs we're following and the last rev applied from it.
+-- resync_requested is set by a manual full resync (catalog.RequestResync)
+-- and cleared by the pull that carries it out.
 CREATE TABLE IF NOT EXISTS peer_sync_state (
-	peer_id   TEXT PRIMARY KEY,
-	epoch     TEXT NOT NULL DEFAULT '',
-	rev       INTEGER NOT NULL DEFAULT 0,
-	gen       INTEGER NOT NULL DEFAULT 0,
-	resync    INTEGER NOT NULL DEFAULT 0,
-	synced_at INTEGER NOT NULL DEFAULT 0
+	peer_id          TEXT PRIMARY KEY,
+	epoch            TEXT NOT NULL DEFAULT '',
+	rev              INTEGER NOT NULL DEFAULT 0,
+	gen              INTEGER NOT NULL DEFAULT 0,
+	resync           INTEGER NOT NULL DEFAULT 0,
+	synced_at        INTEGER NOT NULL DEFAULT 0,
+	resync_requested INTEGER NOT NULL DEFAULT 0
 );
 
 -- hidden_items are items the user excluded from sync, by key: a movie's
@@ -94,6 +103,14 @@ CREATE TABLE IF NOT EXISTS peer_sync_state (
 CREATE TABLE IF NOT EXISTS hidden_items (
 	key        TEXT PRIMARY KEY,
 	created_at INTEGER NOT NULL
+);
+
+-- peer_excluded_folders are folders, on a peer's own filesystem, whose
+-- items this node doesn't take from that peer. See catalog/folders.go.
+CREATE TABLE IF NOT EXISTS peer_excluded_folders (
+	peer_id TEXT NOT NULL,
+	folder  TEXT NOT NULL,
+	PRIMARY KEY (peer_id, folder)
 );
 
 CREATE TABLE IF NOT EXISTS peer_traffic (
@@ -139,6 +156,8 @@ var seriesColumns = []string{
 	"season_number INTEGER NOT NULL DEFAULT 0",
 	"episode_number INTEGER NOT NULL DEFAULT 0",
 	"hidden INTEGER NOT NULL DEFAULT 0",
+	"path TEXT NOT NULL DEFAULT ''",
+	"hidden_folder INTEGER NOT NULL DEFAULT 0",
 }
 
 // localCatalogColumns are added to local_catalog via ALTER TABLE for
@@ -155,6 +174,13 @@ var peerColumns = []string{
 	"version TEXT NOT NULL DEFAULT ''",
 	"name TEXT NOT NULL DEFAULT ''",
 	"pin TEXT NOT NULL DEFAULT ''",
+}
+
+// peerSyncStateColumns are added to peer_sync_state via ALTER TABLE for
+// databases created before manual resyncs existed, same rationale as
+// seriesColumns.
+var peerSyncStateColumns = []string{
+	"resync_requested INTEGER NOT NULL DEFAULT 0",
 }
 
 // Open creates the parent directory if needed, opens the SQLite file at
@@ -190,6 +216,10 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
 	if err := addMissingColumns(db, "local_catalog", localCatalogColumns); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating schema: %w", err)
+	}
+	if err := addMissingColumns(db, "peer_sync_state", peerSyncStateColumns); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}

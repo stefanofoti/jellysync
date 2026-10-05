@@ -119,6 +119,8 @@ func renamePeerID(ctx context.Context, tx *sql.Tx, oldID, newID string) error {
 		`UPDATE peer_catalog SET peer_id = ?2 WHERE peer_id = ?1`,
 		`DELETE FROM peer_sync_state WHERE peer_id = ?2`,
 		`UPDATE peer_sync_state SET peer_id = ?2 WHERE peer_id = ?1`,
+		`DELETE FROM peer_excluded_folders WHERE peer_id = ?2`,
+		`UPDATE peer_excluded_folders SET peer_id = ?2 WHERE peer_id = ?1`,
 		`INSERT INTO peer_traffic (peer_id, direction, bytes)
 			SELECT ?2, direction, bytes FROM peer_traffic WHERE peer_id = ?1 AND true
 			ON CONFLICT(peer_id, direction) DO UPDATE SET bytes = bytes + excluded.bytes`,

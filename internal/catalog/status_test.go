@@ -35,6 +35,8 @@ func testDB(t *testing.T) *sql.DB {
 			season_number    INTEGER NOT NULL DEFAULT 0,
 			episode_number   INTEGER NOT NULL DEFAULT 0,
 			hidden           INTEGER NOT NULL DEFAULT 0,
+			path             TEXT NOT NULL DEFAULT '',
+			hidden_folder    INTEGER NOT NULL DEFAULT 0,
 			updated_at       INTEGER NOT NULL
 		);
 		CREATE TABLE hidden_items (

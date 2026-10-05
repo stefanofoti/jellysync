@@ -40,6 +40,10 @@ type Entry struct {
 	TmdbID    string `json:"tmdb_id,omitempty"`
 	TvdbID    string `json:"tvdb_id,omitempty"`
 	ImdbID    string `json:"imdb_id,omitempty"`
+	// Path is the item's file (a series root: its folder) as the owning
+	// node's Jellyfin reports it, on that node's filesystem. Display and
+	// folder exclusions only (see folders.go); empty from older peers.
+	Path string `json:"path,omitempty"`
 
 	// Episode-only grouping fields, carried across peers so a
 	// remote-elected episode groups under its series the same way a local
@@ -122,6 +126,7 @@ func LocalEntries(ctx context.Context, jf *jellyfin.Client, strmDir string) ([]E
 			TmdbID:         it.TmdbID,
 			TvdbID:         it.TvdbID,
 			ImdbID:         it.ImdbID,
+			Path:           it.Path,
 			SeriesGlobalID: it.SeriesGlobalID,
 			SeriesName:     it.SeriesName,
 			SeasonNumber:   it.SeasonNumber,
@@ -339,10 +344,11 @@ func FetchPeerCatalog(ctx context.Context, client *http.Client, peerURL, selfID 
 // it), a hidden remote item keeps its elected peer but Reconcile gives it
 // no .strm file. Hides of items nothing offers any more are dropped.
 //
-// Only ONLINE peers' mirrors take part in the election. A peer whose pull
-// failed this cycle but is still ONLINE keeps offering what it last
-// reported, rather than having all its items withdrawn over one slow
-// request.
+// Only ONLINE peers are pulled. Their mirrors take part in the election,
+// and so do those of peers that went DEGRADED or OFFLINE less than
+// peers.WithdrawAfter ago (see Peer.Offering): a peer whose pull failed, or
+// that missed a heartbeat or is restarting, keeps offering what it last
+// reported, rather than having all its items withdrawn over one blip.
 //
 // The returned stats (partial on error) say what each step did; the
 // caller notifies peers when Local.Changed() > 0.
@@ -362,13 +368,18 @@ func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, 
 	}
 
 	all := registry.List()
+	now := time.Now()
 	online := make([]peers.Peer, 0, len(all))
-	onlineIDs := make(map[string]bool, len(all))
+	offeringIDs := make(map[string]bool, len(all))
 	for _, p := range all {
-		if p.State == peers.StateOnline {
+		switch {
+		case p.State == peers.StateOnline:
 			online = append(online, p)
-			onlineIDs[p.ID] = true
-		} else {
+			offeringIDs[p.ID] = true
+		case p.Offering(now):
+			offeringIDs[p.ID] = true
+			slog.Info("not pulling from peer this cycle: not online; keeping its last-known items for now", "peer", p.ID, "state", p.State, "withdrawn_after", peers.WithdrawAfter)
+		default:
 			slog.Info("skipping peer this cycle: not online; its items are withdrawn until it is", "peer", p.ID, "state", p.State)
 		}
 	}
@@ -379,7 +390,7 @@ func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, 
 	}
 
 	started := time.Now()
-	desired, offered, err := elect(ctx, db, onlineIDs)
+	desired, offered, err := elect(ctx, db, offeringIDs)
 	if err != nil {
 		return st, fmt.Errorf("electing: %w", err)
 	}
@@ -392,7 +403,7 @@ func Sync(ctx context.Context, db *sql.DB, ix *Index, registry *peers.Registry, 
 		"local_items", st.Election.Local, "remote_items", st.Election.Remote,
 		"upserted", st.Election.Upserted, "stale_local_deleted", st.Election.StaleLocalDeleted,
 		"orphans_cleared", st.Election.OrphansCleared, "inert_deleted", st.Election.InertDeleted,
-		"hidden", st.Election.Hidden, "hides_dropped", st.Election.HidesDropped,
+		"hidden", st.Election.Hidden, "hidden_folder", st.Election.HiddenFolder, "hides_dropped", st.Election.HidesDropped,
 		"duration", st.Election.Duration.Round(time.Millisecond))
 	return st, nil
 }
@@ -414,6 +425,7 @@ type ElectionStats struct {
 	OrphansCleared    int // remote rows no peer offers any more
 	InertDeleted      int
 	Hidden            int // desired rows the user hid
+	HiddenFolder      int // desired rows only offered from under excluded folders
 	HidesDropped      int // hides of items nothing offers any more
 	Duration          time.Duration
 }
@@ -427,24 +439,30 @@ type itemState struct {
 	seriesGlobalID, seriesName  string
 	seasonNumber, episodeNumber int
 	hidden                      bool
+	path                        string
+	hiddenFolder                bool // only offered from under excluded folders
 }
 
 func stateFromEntry(e Entry) itemState {
 	return itemState{
-		name: e.Name, mediaType: e.MediaType,
+		name: e.Name, mediaType: e.MediaType, path: e.Path,
 		seriesGlobalID: e.SeriesGlobalID, seriesName: e.SeriesName,
 		seasonNumber: e.SeasonNumber, episodeNumber: e.EpisodeNumber,
 	}
 }
 
 // elect computes the desired catalog_items content from the local index and
-// the mirrors of the given peers. offered is the hide key (see hideKey) of
+// the mirrors of the given (offering) peers. offered is the hide key (see hideKey) of
 // every item any source still has, ONLINE or not, for pruneHidden.
-func elect(ctx context.Context, db *sql.DB, onlinePeers map[string]bool) (desired map[string]itemState, offered map[string]bool, err error) {
+func elect(ctx context.Context, db *sql.DB, offeringPeers map[string]bool) (desired map[string]itemState, offered map[string]bool, err error) {
 	desired = make(map[string]itemState)
 	offered = make(map[string]bool)
 
 	hidden, err := hiddenSet(ctx, db)
+	if err != nil {
+		return nil, nil, err
+	}
+	excluded, err := excludedFolders(ctx, db)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -481,6 +499,10 @@ func elect(ctx context.Context, db *sql.DB, onlinePeers map[string]bool) (desire
 
 	// Ordered by peer_id, so the first offer seen for an item comes from
 	// the lexicographically smallest peer: that's the elected primary.
+	// Offers under a folder excluded for their peer don't count; the first
+	// of those is kept in fallback, so an item nothing else offers is still
+	// listed, as hidden by folder.
+	fallback := make(map[string]itemState)
 	rows, err = db.QueryContext(ctx, `SELECT peer_id, global_id, entry FROM peer_catalog ORDER BY global_id, peer_id`)
 	if err != nil {
 		return nil, nil, err
@@ -496,7 +518,7 @@ func elect(ctx context.Context, db *sql.DB, onlinePeers map[string]bool) (desire
 			return nil, nil, err
 		}
 		offered[hideKey(e)] = true
-		if !onlinePeers[peerID] {
+		if !offeringPeers[peerID] {
 			continue
 		}
 		if _, taken := desired[globalID]; taken {
@@ -506,9 +528,24 @@ func elect(ctx context.Context, db *sql.DB, onlinePeers map[string]bool) (desire
 		st.peerID = peerID
 		st.peerItemID = e.ItemID
 		st.hidden = isHidden(hidden, e)
+		if underAnyFolder(e.Path, excluded[peerID]) {
+			if _, ok := fallback[globalID]; !ok {
+				st.hiddenFolder = true
+				fallback[globalID] = st
+			}
+			continue
+		}
 		desired[globalID] = st
 	}
-	return desired, offered, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	for id, st := range fallback {
+		if _, taken := desired[id]; !taken {
+			desired[id] = st
+		}
+	}
+	return desired, offered, nil
 }
 
 // writeElection diffs desired against catalog_items and applies only the
@@ -537,6 +574,9 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 		if d.hidden {
 			st.Hidden++
 		}
+		if d.hiddenFolder {
+			st.HiddenFolder++
+		}
 		if d.local {
 			st.Local++
 		} else {
@@ -546,7 +586,7 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 	existing := make(map[string]itemState)
 	rows, err := db.QueryContext(ctx, `
 		SELECT global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id,
-		       series_global_id, series_name, season_number, episode_number, hidden
+		       series_global_id, series_name, season_number, episode_number, hidden, path, hidden_folder
 		FROM catalog_items
 	`)
 	if err != nil {
@@ -557,7 +597,7 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 		var row itemState
 		var localItemID, peerID, peerItemID sql.NullString
 		if err := rows.Scan(&id, &row.name, &row.mediaType, &row.local, &localItemID, &peerID, &peerItemID,
-			&row.seriesGlobalID, &row.seriesName, &row.seasonNumber, &row.episodeNumber, &row.hidden); err != nil {
+			&row.seriesGlobalID, &row.seriesName, &row.seasonNumber, &row.episodeNumber, &row.hidden, &row.path, &row.hiddenFolder); err != nil {
 			rows.Close()
 			return st, fmt.Errorf("reading catalog items: %w", err)
 		}
@@ -577,8 +617,8 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 			}
 			st.Upserted++
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO catalog_items (global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, series_global_id, series_name, season_number, episode_number, hidden, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				INSERT INTO catalog_items (global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, series_global_id, series_name, season_number, episode_number, hidden, path, hidden_folder, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(global_id) DO UPDATE SET
 					name             = excluded.name,
 					media_type       = excluded.media_type,
@@ -591,9 +631,11 @@ func writeElection(ctx context.Context, db *sql.DB, desired map[string]itemState
 					season_number    = excluded.season_number,
 					episode_number   = excluded.episode_number,
 					hidden           = excluded.hidden,
+					path             = excluded.path,
+					hidden_folder    = excluded.hidden_folder,
 					updated_at       = excluded.updated_at
 			`, id, d.name, d.mediaType, d.local, nullIfEmpty(d.localItemID), nullIfEmpty(d.peerID), nullIfEmpty(d.peerItemID),
-				d.seriesGlobalID, d.seriesName, d.seasonNumber, d.episodeNumber, d.hidden, now); err != nil {
+				d.seriesGlobalID, d.seriesName, d.seasonNumber, d.episodeNumber, d.hidden, d.path, d.hiddenFolder, now); err != nil {
 				return fmt.Errorf("upserting catalog item %s: %w", id, err)
 			}
 		}

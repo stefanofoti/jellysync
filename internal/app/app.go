@@ -100,6 +100,7 @@ func New(ctx context.Context, cfg *config.Config, store *sql.DB, opts Options) (
 	}
 	a.registry.SetOtherIDs(a.auth)
 	a.registry.SetTransports(cfg.HTTPPeers, cfg.MTLSPeers)
+	a.registry.OnOfferingChange(func() { a.queue.Push(syncrun.Request{Reason: syncrun.ReasonPeerState}) })
 	for _, p := range a.registry.List() {
 		slog.Info("tracking peer", "peer", p.ID, "url", p.URL, "state", p.State, "mtls", p.Pin != "")
 	}
@@ -116,6 +117,7 @@ func New(ctx context.Context, cfg *config.Config, store *sql.DB, opts Options) (
 	trigger := synctrigger.Handler(a.registry, a.tracker,
 		func() { a.queue.Push(syncrun.Request{RefreshLocal: true, Reason: syncrun.ReasonManual}) },
 		func() { a.queue.Push(syncrun.Request{Reason: syncrun.ReasonManual}) },
+		func(ctx context.Context, peerID string) error { return catalog.RequestResync(ctx, store, peerID) },
 	)
 	notify := catalog.NotifyHandler(func() { a.queue.Push(syncrun.Request{Reason: syncrun.ReasonPeerNotify}) })
 
@@ -288,6 +290,11 @@ func (a *App) dashboardMux(streams, trigger, notify http.HandlerFunc) (http.Hand
 	mux.HandleFunc("POST /api/v1/peers", peers.AddHandler(a.registry))
 	mux.HandleFunc("POST /api/v1/peers/redeem", peers.RedeemHandler(a.registry, a.cfg.NodeID))
 	mux.HandleFunc("DELETE /api/v1/peers/{peerID}", peers.RemoveHandler(a.registry))
+	excludedFolders := catalog.ExcludedFoldersHandler(a.db,
+		func(id string) bool { _, ok := a.registry.Get(id); return ok },
+		func() { a.queue.Push(syncrun.Request{Reason: syncrun.ReasonSettings}) })
+	mux.HandleFunc("GET /api/v1/peers/{peerID}/excluded-folders", excludedFolders)
+	mux.HandleFunc("PUT /api/v1/peers/{peerID}/excluded-folders", excludedFolders)
 	mux.HandleFunc("GET /api/v1/peerport", a.peerPortInfo)
 	if a.cfg.MTLSPeers {
 		mux.HandleFunc("POST /api/v1/invites", peerauth.CreateInviteHandler(a.auth, peerauth.InviteConfig{
@@ -304,6 +311,7 @@ func (a *App) dashboardMux(streams, trigger, notify http.HandlerFunc) (http.Hand
 	mux.HandleFunc("DELETE /api/v1/clients/{clientID}", peerauth.RevokeClientHandler(a.auth))
 	mux.HandleFunc("GET /api/v1/items", catalog.ItemsHandler(a.db))
 	mux.HandleFunc("GET /api/v1/items/series/episodes", catalog.SeriesEpisodesHandler(a.db))
+	mux.HandleFunc("GET /api/v1/items/info", catalog.ItemInfoHandler(a.db, a.registry.List))
 	mux.HandleFunc("PUT /api/v1/items/hidden", catalog.HideHandler(a.db))
 	mux.HandleFunc("GET /api/v1/stats", catalog.StatsHandler(a.db))
 	mux.HandleFunc("GET /api/v1/traffic", metrics.TrafficHandler(a.collector, a.registry))

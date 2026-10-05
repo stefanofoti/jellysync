@@ -137,6 +137,12 @@ Every movie and series in the dashboard has a **hide** button that leaves it out
 
 Hiding a series hides all of its episodes, including ones added later. A hide takes effect at the next sync (the dashboard shows it as pending until then), and **unhide** reverses it the same way. If a hidden title goes away on its own (you delete the file, or the peer stops offering it), the hide is forgotten, so the title shows up as normal if it ever comes back.
 
+#### Excluding a peer's folders
+
+Every title in the dashboard shows its file path as the owning node's Jellyfin reports it: your own path for local titles, the peer's path for remote ones. Your peers see your paths the same way.
+
+In **Settings → Peers**, each peer has a list of **excluded folders**, written as paths on that peer's machine (e.g. `/Data/Media/Remote`). Titles the peer offers from inside those folders aren't taken from it: they get no pointer file and show as **hidden (folder)**. Matching is by whole folder and case-sensitive, so `/Data/Media/Remote` doesn't exclude `/Data/Media/Remote2` or `/Data/Media/remote`. If another peer offers the same title from a folder that isn't excluded, that copy is used instead. A title hidden by folder can't be unhidden on its own; remove the folder from the list instead. Changes apply right away. Peers running an older version don't send paths, so their titles are never excluded.
+
 ### Playback
 
 ```mermaid
@@ -283,6 +289,7 @@ Your node's private key lives in its database (`DB_PATH`). Back it up with the r
 
 ## Troubleshooting
 
+- **A peer's titles disappeared.** A peer that stays unreachable for more than 15 minutes has its titles withdrawn from your library; they come back on their own as soon as it's reachable again. Shorter outages (a restart, a network blip) don't remove anything.
 - **Nothing shows up after adding a peer.** Run a sync from the dashboard, or wait for the next scheduled one. If it's still empty, check the peer's status in the dashboard — it should say `ONLINE`. If it says `OFFLINE`, their port isn't reachable from your machine: check their `PUBLIC_URL`, their port forwarding, and (for a legacy peer) your VPN connection to them.
 - **"invite was rejected".** It was already used, cancelled, or is older than 24 hours. Ask for a new one.
 - **"not the one that created this invite".** The address in the invite leads to a different machine than the one that created it — usually a wrong `PUBLIC_URL` or port forward on the sharer's side. jellysync refuses to connect.

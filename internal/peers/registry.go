@@ -41,6 +41,13 @@ const (
 	offlineAfterMisses  = 3
 )
 
+// WithdrawAfter is how long a peer may stay unreachable before its items
+// are withdrawn (its .strm files removed). Until then they stay up on what
+// it last offered, so a missed heartbeat or a peer restart doesn't make
+// every title it shares vanish from Jellyfin and come back as new items. A
+// var so tests can shorten it.
+var WithdrawAfter = 15 * time.Minute
+
 type Peer struct {
 	ID      string
 	URL     string
@@ -51,8 +58,27 @@ type Peer struct {
 	// Pin is the peer's key pin when it was paired by invite (reached
 	// with mTLS on its peer port); "" for a legacy peer added by URL.
 	Pin string
+	// LastSeen is when a probe last succeeded (persisted as
+	// last_seen_at); zero if never.
+	LastSeen time.Time
 
 	missed int
+	// offering is Offering as of the last heartbeat, to tell when it flips.
+	offering bool
+}
+
+// Offering reports whether p's items take part in the election at now: an
+// ONLINE peer's always do, a DEGRADED or OFFLINE one's only within
+// WithdrawAfter of its last successful probe, a DISABLED one's never.
+func (p Peer) Offering(now time.Time) bool {
+	switch p.State {
+	case StateOnline:
+		return true
+	case StateDegraded, StateOffline:
+		return !p.LastSeen.IsZero() && now.Sub(p.LastSeen) < WithdrawAfter
+	default:
+		return false
+	}
 }
 
 type Registry struct {
@@ -69,6 +95,10 @@ type Registry struct {
 	mu      sync.RWMutex
 	peers   map[string]*Peer
 	cancels map[string]context.CancelFunc
+	// onOfferingChange, if set, is called whenever a heartbeat flips a
+	// peer's Offering, so its items are withdrawn or restored right away
+	// instead of at the next scheduled sync.
+	onOfferingChange func()
 }
 
 // NewRegistry upserts the configured peers into the peers table (so they
@@ -104,7 +134,7 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer, id *
 		return nil, err
 	}
 
-	rows, err := db.QueryContext(ctx, `SELECT id, url, state, version, name, pin FROM peers`)
+	rows, err := db.QueryContext(ctx, `SELECT id, url, state, version, name, pin, COALESCE(last_seen_at, 0) FROM peers`)
 	if err != nil {
 		return nil, fmt.Errorf("loading peers: %w", err)
 	}
@@ -112,10 +142,15 @@ func NewRegistry(ctx context.Context, db *sql.DB, configured []config.Peer, id *
 	for rows.Next() {
 		var p Peer
 		var state string
-		if err := rows.Scan(&p.ID, &p.URL, &state, &p.Version, &p.Name, &p.Pin); err != nil {
+		var lastSeen int64
+		if err := rows.Scan(&p.ID, &p.URL, &state, &p.Version, &p.Name, &p.Pin, &lastSeen); err != nil {
 			return nil, fmt.Errorf("scanning peer: %w", err)
 		}
 		p.State = State(state)
+		if lastSeen > 0 {
+			p.LastSeen = time.Unix(lastSeen, 0)
+		}
+		p.offering = p.Offering(time.Now())
 		p.IP = literalIP(p.URL)
 		r.peers[p.ID] = &p
 	}
@@ -165,15 +200,17 @@ func (r *Registry) Probe(ctx context.Context, url string) (name string, version 
 // none yet); the next heartbeat corrects both either way.
 func (r *Registry) AddPeer(ctx context.Context, id, url, name, version, pin string) error {
 	url = strings.TrimRight(url, "/")
+	now := time.Now()
 	if _, err := r.db.ExecContext(ctx, `
-		INSERT INTO peers (id, url, state, name, version, pin) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET url = excluded.url, name = excluded.name, version = excluded.version, pin = excluded.pin
-	`, id, url, StateOnline, name, version, pin); err != nil {
+		INSERT INTO peers (id, url, state, name, version, pin, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET url = excluded.url, name = excluded.name, version = excluded.version, pin = excluded.pin,
+			last_seen_at = excluded.last_seen_at
+	`, id, url, StateOnline, name, version, pin, now.Unix()); err != nil {
 		return fmt.Errorf("adding peer %s: %w", id, err)
 	}
 
 	r.mu.Lock()
-	p := &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version, IP: resolveIP(ctx, url), Pin: pin}
+	p := &Peer{ID: id, URL: url, State: StateOnline, Name: name, Version: version, IP: resolveIP(ctx, url), Pin: pin, LastSeen: now, offering: true}
 	if !r.enabledLocked(p) {
 		p.State = StateDisabled
 	}
@@ -301,6 +338,14 @@ func (r *Registry) SetTransports(httpPeers, mtlsPeers bool) {
 	}
 }
 
+// OnOfferingChange sets fn to be called (from a heartbeat goroutine)
+// whenever a peer's Offering flips. Call before RunHeartbeat.
+func (r *Registry) OnOfferingChange(fn func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onOfferingChange = fn
+}
+
 // HTTPPeers and MTLSPeers report whether legacy and paired peers are on.
 func (r *Registry) HTTPPeers() bool { r.mu.RLock(); defer r.mu.RUnlock(); return !r.httpOff }
 func (r *Registry) MTLSPeers() bool { r.mu.RLock(); defer r.mu.RUnlock(); return !r.mtlsOff }
@@ -392,12 +437,15 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 		return
 	}
 	prevState := p.State
+	now := time.Now()
+	wasOffering := p.offering
 	if ip != "" {
 		p.IP = ip
 	}
 	if healthy {
 		p.missed = 0
 		p.State = StateOnline
+		p.LastSeen = now
 		if version != "" {
 			p.Version = version
 		}
@@ -416,6 +464,10 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	newState := p.State
 	newVersion := p.Version
 	newName := p.Name
+	offering := p.Offering(now)
+	p.offering = offering
+	lastSeen := p.LastSeen
+	onChange := r.onOfferingChange
 	r.mu.Unlock()
 
 	switch {
@@ -433,7 +485,7 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	if healthy {
 		_, execErr = r.db.ExecContext(ctx, `
 			UPDATE peers SET state = ?, last_seen_at = ?, version = ?, name = ? WHERE id = ?
-		`, string(newState), time.Now().Unix(), newVersion, newName, id)
+		`, string(newState), now.Unix(), newVersion, newName, id)
 	} else {
 		_, execErr = r.db.ExecContext(ctx, `
 			UPDATE peers SET state = ? WHERE id = ?
@@ -441,6 +493,17 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 	}
 	if execErr != nil {
 		slog.Error("persisting peer state", "peer", id, logging.Err(execErr))
+	}
+
+	if offering != wasOffering {
+		if offering {
+			slog.Info("peer is back; restoring its items", "peer", id)
+		} else {
+			slog.Warn("peer unreachable for too long; withdrawing its items", "peer", id, "state", newState, "last_seen", lastSeen, "after", WithdrawAfter)
+		}
+		if onChange != nil {
+			onChange()
+		}
 	}
 }
 

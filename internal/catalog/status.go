@@ -15,7 +15,7 @@ const (
 
 const itemColumns = `global_id, name, media_type, local, local_item_id, primary_peer_id, primary_item_id, strm_path,
 	       series_global_id, series_name, season_number, episode_number,
-	       hidden, ` + hiddenWantedExpr
+	       hidden, ` + hiddenWantedExpr + `, path, hidden_folder`
 
 // hiddenWantedExpr is whether the user currently wants a catalog_items row
 // hidden (an episode by its series), which the row's own hidden column only
@@ -24,12 +24,15 @@ const hiddenWantedExpr = `EXISTS (SELECT 1 FROM hidden_items h WHERE h.key =
 	CASE WHEN media_type = 'episode' THEN ` + seriesKeyExpr + ` ELSE global_id END)`
 
 type itemDTO struct {
-	GlobalID       string `json:"global_id"`
-	Name           string `json:"name"`
-	MediaType      string `json:"media_type"`
-	Local          bool   `json:"local"`
-	PrimaryPeerID  string `json:"primary_peer_id,omitempty"`
-	StrmPath       string `json:"strm_path,omitempty"`
+	GlobalID      string `json:"global_id"`
+	Name          string `json:"name"`
+	MediaType     string `json:"media_type"`
+	Local         bool   `json:"local"`
+	PrimaryPeerID string `json:"primary_peer_id,omitempty"`
+	StrmPath      string `json:"strm_path,omitempty"`
+	// Path is the elected copy's file as its owner's Jellyfin reports it:
+	// on this node's filesystem if local, else on the peer's.
+	Path           string `json:"path,omitempty"`
 	SeriesGlobalID string `json:"series_global_id,omitempty"`
 	SeriesName     string `json:"series_name,omitempty"`
 	SeasonNumber   int    `json:"season_number,omitempty"`
@@ -40,6 +43,9 @@ type itemDTO struct {
 	// effect at the next sync.
 	Hidden      bool `json:"hidden"`
 	HidePending bool `json:"hide_pending,omitempty"`
+	// HiddenFolder: every offer lies under a folder excluded for its peer
+	// (see folders.go). No .strm, and it can't be unhidden per item.
+	HiddenFolder bool `json:"hidden_folder,omitempty"`
 
 	// StreamPeerID/StreamItemID are the {peerID}/{itemID} pair to hit
 	// GET /api/v1/proxy/stream/{peerID}/{itemID} for this item directly —
@@ -75,6 +81,10 @@ type seriesSummaryDTO struct {
 	// Hidden/HidePending as on itemDTO, for the whole series.
 	Hidden      bool `json:"hidden"`
 	HidePending bool `json:"hide_pending,omitempty"`
+	// FolderHiddenCount episodes are hidden by a folder exclusion;
+	// HiddenFolder when that's all of them.
+	FolderHiddenCount int  `json:"folder_hidden_count,omitempty"`
+	HiddenFolder      bool `json:"hidden_folder,omitempty"`
 }
 
 type seriesSummaryPage struct {
@@ -97,7 +107,7 @@ func scanItemRows(rows *sql.Rows) ([]itemDTO, error) {
 		var hiddenApplied bool
 		var localItemID, primaryPeerID, primaryItemID, strmPath sql.NullString
 		if err := rows.Scan(&it.GlobalID, &it.Name, &it.MediaType, &localInt, &localItemID, &primaryPeerID, &primaryItemID, &strmPath,
-			&it.SeriesGlobalID, &it.SeriesName, &it.SeasonNumber, &it.EpisodeNumber, &hiddenApplied, &it.Hidden); err != nil {
+			&it.SeriesGlobalID, &it.SeriesName, &it.SeasonNumber, &it.EpisodeNumber, &hiddenApplied, &it.Hidden, &it.Path, &it.HiddenFolder); err != nil {
 			return nil, err
 		}
 		it.HidePending = it.Hidden != hiddenApplied
@@ -304,7 +314,8 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	rows, err := db.QueryContext(r.Context(), `
 		SELECT `+seriesKeyExpr+` AS skey, MIN(series_name), SUM(local), COUNT(*),
-		       MAX(hidden), EXISTS (SELECT 1 FROM hidden_items h WHERE h.key = `+seriesKeyExpr+`)
+		       MAX(hidden), EXISTS (SELECT 1 FROM hidden_items h WHERE h.key = `+seriesKeyExpr+`),
+		       SUM(hidden_folder)
 		FROM catalog_items
 		WHERE media_type = 'episode' AND `+ownerCond+`
 		GROUP BY skey
@@ -321,10 +332,11 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	for rows.Next() {
 		var it seriesSummaryDTO
 		var hiddenApplied bool
-		if err := rows.Scan(&it.SeriesKey, &it.SeriesName, &it.LocalCount, &it.TotalCount, &hiddenApplied, &it.Hidden); err != nil {
+		if err := rows.Scan(&it.SeriesKey, &it.SeriesName, &it.LocalCount, &it.TotalCount, &hiddenApplied, &it.Hidden, &it.FolderHiddenCount); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		it.HiddenFolder = it.FolderHiddenCount > 0 && it.FolderHiddenCount == it.TotalCount
 		it.HidePending = it.Hidden != hiddenApplied
 		items = append(items, it)
 	}
