@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -344,5 +345,120 @@ func TestItemsHandlerReportsHiddenAndPending(t *testing.T) {
 	series := getSeriesSummaryPage(t, db, "/api/v1/items?type=series")
 	if s := series.Items[0]; !s.Hidden || s.HidePending {
 		t.Errorf("series = %+v, want hidden, not pending", s)
+	}
+}
+
+func seedOrphan(t *testing.T, db *sql.DB, globalID, name string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO catalog_items (global_id, name, media_type, local, updated_at) VALUES (?, ?, 'episode', 1, 0)`,
+		globalID, name); err != nil {
+		t.Fatalf("seed orphan %s: %v", globalID, err)
+	}
+}
+
+func TestOrphanEpisodesListedAsOwnSeries(t *testing.T) {
+	db := testDB(t)
+	seedSeries(t, db, "Alpha Show", 2)
+	seedOrphan(t, db, "titleyear:o1", "Zeta Film")
+	seedOrphan(t, db, "titleyear:o2", "Beta Film")
+
+	page := getSeriesSummaryPage(t, db, "/api/v1/items?type=series&limit=10")
+	if page.Total != 3 || len(page.Items) != 3 {
+		t.Fatalf("got total=%d items=%+v, want 3 series", page.Total, page.Items)
+	}
+	// Sorted by display name, an orphan's being its own.
+	want := []seriesSummaryDTO{
+		{SeriesKey: "series:Alpha Show", SeriesName: "Alpha Show", LocalCount: 2, TotalCount: 2},
+		{SeriesKey: "titleyear:o2", SeriesName: "Beta Film", LocalCount: 1, TotalCount: 1, Orphan: true},
+		{SeriesKey: "titleyear:o1", SeriesName: "Zeta Film", LocalCount: 1, TotalCount: 1, Orphan: true},
+	}
+	for i, w := range want {
+		if page.Items[i] != w {
+			t.Errorf("item %d = %+v, want %+v", i, page.Items[i], w)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/items/series/episodes?key=titleyear:o2", nil)
+	rec := httptest.NewRecorder()
+	SeriesEpisodesHandler(db)(rec, req)
+	var episodes []itemDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &episodes); err != nil {
+		t.Fatalf("status %d, decode: %v", rec.Code, err)
+	}
+	if len(episodes) != 1 || episodes[0].GlobalID != "titleyear:o2" {
+		t.Errorf("orphan's episodes = %+v, want just titleyear:o2", episodes)
+	}
+
+	// Hiding one orphan doesn't hide the other.
+	if err := SetHidden(context.Background(), db, "titleyear:o2", true); err != nil {
+		t.Fatalf("hide orphan: %v", err)
+	}
+	page = getSeriesSummaryPage(t, db, "/api/v1/items?type=series&limit=10")
+	if !page.Items[1].Hidden || page.Items[2].Hidden {
+		t.Errorf("hide of one orphan: %+v", page.Items)
+	}
+}
+
+func TestItemsHandlerSearch(t *testing.T) {
+	db := testDB(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	for id, name := range map[string]string{"m1": "The Gentlemen", "m2": "100% Wolf", "m3": "1000 Ways"} {
+		exec(`INSERT INTO catalog_items (global_id, name, media_type, local, updated_at) VALUES (?, ?, 'movie', 1, 0)`, id, name)
+	}
+	seedSeries(t, db, "Gentlemen Show", 2)
+	seedSeries(t, db, "Other Show", 3)
+	exec(`UPDATE catalog_items SET name = 'Pilot' WHERE global_id = 'series:Other Show-e01'`)
+	exec(`INSERT INTO catalog_items (global_id, name, media_type, local, primary_peer_id, series_global_id, series_name, updated_at)
+		VALUES ('o-bob', 'Finale', 'episode', 0, 'bob', 'series:Other Show', 'Other Show', 0)`)
+	seedOrphan(t, db, "titleyear:o1", "Loose Gentlemen")
+
+	movieCases := map[string][]string{
+		"gentlemen":  {"The Gentlemen"},
+		"GENTLEMEN ": {"The Gentlemen"},
+		"100%":       {"100% Wolf"},
+		"10_":        nil,
+		"":           {"100% Wolf", "1000 Ways", "The Gentlemen"},
+	}
+	for q, want := range movieCases {
+		page := getItemsPage(t, db, "/api/v1/items?type=movie&q="+url.QueryEscape(q))
+		var got []string
+		for _, it := range page.Items {
+			got = append(got, it.Name)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) || page.Total != len(want) {
+			t.Errorf("movies q=%q: total=%d %v, want %v", q, page.Total, got, want)
+		}
+	}
+
+	seriesCases := map[string][]string{
+		"gentlemen": {"Gentlemen Show", "Loose Gentlemen"},
+		"pilot":     {"Other Show"}, // by an episode's name
+		"nothing":   nil,
+	}
+	for q, want := range seriesCases {
+		page := getSeriesSummaryPage(t, db, "/api/v1/items?type=series&q="+url.QueryEscape(q))
+		var got []string
+		for _, it := range page.Items {
+			got = append(got, it.SeriesName)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) || page.Total != len(want) {
+			t.Errorf("series q=%q: total=%d %v, want %v", q, page.Total, got, want)
+		}
+	}
+
+	// A match by one episode still counts the whole series.
+	page := getSeriesSummaryPage(t, db, "/api/v1/items?type=series&q=pilot")
+	if page.Items[0].TotalCount != 4 {
+		t.Errorf("q=pilot: total_count = %d, want 4", page.Items[0].TotalCount)
+	}
+	// ... within the owners filter.
+	page = getSeriesSummaryPage(t, db, "/api/v1/items?type=series&q=pilot&owners=bob")
+	if len(page.Items) != 1 || page.Items[0].TotalCount != 1 {
+		t.Errorf("q=pilot&owners=bob: %+v", page.Items)
 	}
 }

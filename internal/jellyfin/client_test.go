@@ -93,6 +93,34 @@ func TestEpisodeHashAvoidsCrossSeriesCollision(t *testing.T) {
 	}
 }
 
+func TestOrphanEpisodesGetDistinctGlobalIDs(t *testing.T) {
+	// Loose files at a TV library's root: episodes with no series.
+	items := buildCatalogItems([]rawItem{
+		{Id: "o1", Name: "The Gentlemen", Type: "Episode", Path: "/media/a.mkv"},
+		{Id: "o2", Name: "Another Film", Type: "Episode", Path: "/media/b.mkv"},
+	})
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2", len(items))
+	}
+	for _, it := range items {
+		if it.MediaType != "episode" {
+			t.Errorf("%s: MediaType = %q, want episode", it.ItemID, it.MediaType)
+		}
+		if it.SeriesGlobalID != "" {
+			t.Errorf("%s: SeriesGlobalID = %q, want empty", it.ItemID, it.SeriesGlobalID)
+		}
+	}
+	if items[0].GlobalID() == items[1].GlobalID() {
+		t.Errorf("orphan episodes collided on GlobalID %q", items[0].GlobalID())
+	}
+
+	// Stable across nodes: the same orphan elsewhere gets the same ID.
+	again := buildCatalogItems([]rawItem{{Id: "x", Name: "The Gentlemen", Type: "Episode", Path: "/other/a.mkv"}})
+	if again[0].GlobalID() != items[0].GlobalID() {
+		t.Errorf("same orphan got GlobalID %q, then %q", items[0].GlobalID(), again[0].GlobalID())
+	}
+}
+
 func TestBuildCatalogItemsExcludesVirtualItems(t *testing.T) {
 	raw := []rawItem{
 		{

@@ -24,12 +24,16 @@ import (
 
 // seriesKey is an episode's series grouping key, the same one
 // seriesKeyExpr computes in SQL: series_global_id when present, falling back
-// to series_name.
+// to series_name, and for an orphan episode (no series at all) to its own
+// global_id, so hiding one orphan doesn't hide every other.
 func seriesKey(e Entry) string {
-	if e.SeriesGlobalID != "" {
+	switch {
+	case e.SeriesGlobalID != "":
 		return e.SeriesGlobalID
+	case e.SeriesName != "":
+		return e.SeriesName
 	}
-	return e.SeriesName
+	return e.GlobalID
 }
 
 // hideKey is the hidden_items key that hides e: its series key for an

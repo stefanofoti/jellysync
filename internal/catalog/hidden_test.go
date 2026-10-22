@@ -136,4 +136,13 @@ func TestHiddenSeriesCoversEpisodes(t *testing.T) {
 	if !isHidden(map[string]bool{"Show": true}, Entry{GlobalID: "h:1", MediaType: "episode", SeriesName: "Show"}) {
 		t.Error("episode not hidden by series name key")
 	}
+	// An orphan episode (no series) is keyed by its own global_id, so
+	// hiding one doesn't hide every other orphan.
+	orphan := Entry{GlobalID: "titleyear:o1", MediaType: "episode"}
+	if !isHidden(map[string]bool{"titleyear:o1": true}, orphan) {
+		t.Error("orphan not hidden by its own global_id")
+	}
+	if isHidden(map[string]bool{"titleyear:o2": true}, orphan) {
+		t.Error("orphan hidden by another orphan's key")
+	}
 }

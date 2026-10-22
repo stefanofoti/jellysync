@@ -55,7 +55,8 @@
     const owners = filterSources.every((id) => enabledPeers.has(id))
       ? ""
       : `&owners=${[...enabledPeers].map(encodeURIComponent).join(",")}`;
-    const res = await fetch(`/api/v1/items?type=${type}&limit=${limit}&offset=${offset}${owners}`);
+    const q = searchQuery.trim() ? `&q=${encodeURIComponent(searchQuery.trim())}` : "";
+    const res = await fetch(`/api/v1/items?type=${type}&limit=${limit}&offset=${offset}${owners}${q}`);
     if (!res.ok) throw new Error(await res.text());
     return res.json();
   }
@@ -75,6 +76,19 @@
     const seq = ++seriesSeq;
     const page = await fetchItemsPage("series", offset, seriesPage.limit);
     if (seq === seriesSeq) seriesPage = page;
+  }
+
+  // Name search, server-side (the `q` param) like the source filter, so it
+  // covers the whole catalog rather than the loaded page. Debounced; a new
+  // query starts both tabs over from the first page.
+  let searchQuery = $state("");
+  let searchTimer;
+
+  function onSearchInput() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      Promise.all([loadMovies(0), loadSeries(0)]).catch((e) => (error = String(e)));
+    }, 250);
   }
 
   // Hides or unhides a movie (key = global_id) or a whole series (key =
@@ -539,7 +553,15 @@
     return number === 0 ? "Specials" : `Season ${number}`;
   }
 
+  // An episode its owner's Jellyfin attaches to no series (a loose file at
+  // the root of a TV library). The backend lists it as a series of its own,
+  // under its own name; it has no meaningful season/episode number.
+  function isOrphan(item) {
+    return item.media_type === "episode" && !item.series_global_id && !item.series_name;
+  }
+
   function episodeLabel(item) {
+    if (isOrphan(item)) return item.name;
     const season = String(item.season_number ?? 0).padStart(2, "0");
     const episode = String(item.episode_number ?? 0).padStart(2, "0");
     return `S${season}E${episode} · ${item.name}`;
@@ -631,6 +653,7 @@
       hidePending: item.hide_pending,
       hiddenFolder: item.hidden_folder,
       folderHiddenCount: item.folder_hidden_count || 0,
+      orphan: item.orphan || false,
     })),
   );
 
@@ -903,7 +926,7 @@
     </section>
 
     <section class="rounded border border-neutral-800 bg-neutral-900/50 min-w-0">
-      <div class="flex items-center justify-between gap-2 px-3 sm:px-4 py-3 border-b border-neutral-800">
+      <div class="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-4 py-3 border-b border-neutral-800">
         <div class="flex items-center gap-1">
           <button
             class={`rounded px-3 py-1 text-sm ${activeTab === "movies" ? "bg-neutral-700 text-neutral-100" : "text-neutral-500 hover:text-neutral-300"}`}
@@ -918,6 +941,15 @@
             Series
           </button>
         </div>
+
+        <input
+          type="search"
+          placeholder="Search…"
+          aria-label="Search by name"
+          class="order-last basis-full sm:order-none sm:basis-auto min-w-0 sm:flex-1 sm:max-w-xs rounded border border-neutral-700 bg-neutral-900 px-3 py-1 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-500 focus:outline-none"
+          bind:value={searchQuery}
+          oninput={onSearchInput}
+        />
 
         <div class="relative">
           <button
@@ -979,7 +1011,7 @@
                 </tr>
               {/if}
             {:else}
-              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No movies match the current filter.</td></tr>
+              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No movies match the current filter{searchQuery.trim() ? " and search" : ""}.</td></tr>
             {/each}
           {:else}
             {#each seriesRows as row (row.key)}
@@ -990,6 +1022,12 @@
                 <td class={`px-3 sm:px-4 py-2 break-words ${row.hidden || row.hiddenFolder ? "text-neutral-500" : ""}`}>
                   <span class="inline-block w-4 text-neutral-500">{expandedSeries.has(row.key) ? "▾" : "▸"}</span>
                   {row.name}
+                  {#if row.orphan}
+                    <span
+                      class="ml-1 rounded px-2 py-0.5 text-xs bg-amber-500/20 text-amber-400"
+                      title="Its owner's Jellyfin has this episode outside any series folder, so it's listed on its own. Only its owner can fix that."
+                    >no series</span>
+                  {/if}
                 </td>
                 <td class="px-4 py-2 text-neutral-500 hidden sm:table-cell">series</td>
                 <td class="px-4 py-2">
@@ -1019,9 +1057,11 @@
                   </tr>
                 {/if}
                 {#each seasonsFor(row.key) as season (season.number)}
-                  <tr class="border-b border-neutral-800/60 last:border-0 bg-neutral-900/30">
-                    <td class="px-4 py-1.5 pl-9 text-neutral-500 text-xs" colspan="4">{seasonLabel(season.number)}</td>
-                  </tr>
+                  {#if !row.orphan}
+                    <tr class="border-b border-neutral-800/60 last:border-0 bg-neutral-900/30">
+                      <td class="px-4 py-1.5 pl-9 text-neutral-500 text-xs" colspan="4">{seasonLabel(season.number)}</td>
+                    </tr>
+                  {/if}
                   {#each season.episodes as episode (episode.global_id)}
                     <tr class="border-b border-neutral-800/60 last:border-0">
                       <td class={`px-3 sm:px-4 py-2 pl-8 sm:pl-14 break-words max-w-0 w-full ${episode.hidden_folder ? "text-neutral-500" : "text-neutral-300"}`}>
@@ -1056,7 +1096,7 @@
                 {/each}
               {/if}
             {:else}
-              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No series match the current filter.</td></tr>
+              <tr><td class="px-4 py-3 text-neutral-500" colspan="4">No series match the current filter{searchQuery.trim() ? " and search" : ""}.</td></tr>
             {/each}
           {/if}
         </tbody>

@@ -37,7 +37,8 @@
   let title = $derived(target.kind === "series" ? target.row.name : episodeTitle(item));
 
   function episodeTitle(it) {
-    if (it.media_type !== "episode") return it.name;
+    // An orphan episode (no series) has no meaningful series or numbering.
+    if (it.media_type !== "episode" || (!it.series_global_id && !it.series_name)) return it.name;
     const s = String(it.season_number ?? 0).padStart(2, "0");
     const e = String(it.episode_number ?? 0).padStart(2, "0");
     return `${it.series_name} · S${s}E${e} · ${it.name}`;

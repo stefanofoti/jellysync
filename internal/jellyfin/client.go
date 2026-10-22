@@ -187,6 +187,15 @@ func episodeHash(seriesGlobalID string, season, episode int) string {
 	return hashParts(fmt.Sprintf("%s_%d_%d", seriesGlobalID, season, episode))
 }
 
+// orphanEpisodeHash is the fallback for an episode Jellyfin attaches to no
+// series (e.g. a loose file at the root of a TV library). With no series to
+// fold in, episodeHash would give every orphan at the same season/episode
+// (usually 0/0) one shared global_id, so the episode's own name and year go
+// in instead.
+func orphanEpisodeHash(name string, year, season, episode int) string {
+	return hashParts(fmt.Sprintf("orphan_%s_%d_%d_%d", normalize(name), year, season, episode))
+}
+
 func normalize(name string) string {
 	normalized := nonAlnum.ReplaceAllString(strings.ToLower(name), "-")
 	return strings.Trim(normalized, "-")
@@ -338,7 +347,11 @@ func buildCatalogItems(raw []rawItem) []CatalogItem {
 			item.SeriesName = ri.SeriesName
 			item.SeasonNumber = ri.ParentIndexNumber
 			item.EpisodeNumber = ri.IndexNumber
-			item.TitleYearHash = episodeHash(item.SeriesGlobalID, item.SeasonNumber, item.EpisodeNumber)
+			if item.SeriesGlobalID != "" {
+				item.TitleYearHash = episodeHash(item.SeriesGlobalID, item.SeasonNumber, item.EpisodeNumber)
+			} else {
+				item.TitleYearHash = orphanEpisodeHash(item.Name, item.Year, item.SeasonNumber, item.EpisodeNumber)
+			}
 		} else {
 			item.TitleYearHash = titleYearHash(item.Name, item.Year)
 		}

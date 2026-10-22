@@ -85,6 +85,10 @@ type seriesSummaryDTO struct {
 	// HiddenFolder when that's all of them.
 	FolderHiddenCount int  `json:"folder_hidden_count,omitempty"`
 	HiddenFolder      bool `json:"hidden_folder,omitempty"`
+	// Orphan: an episode its owner's Jellyfin attaches to no series (e.g. a
+	// loose file at the root of a TV library), listed on its own under its
+	// own name and keyed by its global_id (see seriesKeyExpr).
+	Orphan bool `json:"orphan,omitempty"`
 }
 
 type seriesSummaryPage struct {
@@ -96,8 +100,28 @@ type seriesSummaryPage struct {
 
 // seriesKeyExpr groups catalog_items episode rows into series: by
 // series_global_id when present (the cross-node-stable key), falling back to
-// series_name for older rows / providerless series.
-const seriesKeyExpr = `COALESCE(NULLIF(series_global_id, ''), series_name)`
+// series_name for older rows / providerless series, and to the episode's own
+// global_id for an orphan episode (no series at all), which then forms a
+// series of its own. Must match seriesKey.
+const seriesKeyExpr = `COALESCE(NULLIF(series_global_id, ''), NULLIF(series_name, ''), global_id)`
+
+// seriesNameExpr is the display name of one seriesKeyExpr group: its series
+// name (MAX, so an older row with an empty one doesn't win), else, for an
+// orphan episode, the episode's own name.
+const seriesNameExpr = `COALESCE(NULLIF(MAX(series_name), ''), MIN(name))`
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// searchPattern turns the optional `q` query param into a LIKE pattern
+// (use with ESCAPE '\') matching it anywhere in a name. ok is false when
+// there's nothing to search for. SQLite's LIKE ignores case for ASCII only.
+func searchPattern(r *http.Request) (pattern string, ok bool) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		return "", false
+	}
+	return "%" + likeEscaper.Replace(q) + "%", true
+}
 
 func scanItemRows(rows *sql.Rows) ([]itemDTO, error) {
 	items := make([]itemDTO, 0)
@@ -250,10 +274,14 @@ func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	ownerCond, ownerArgs := ownerFilter(r)
+	where, args := ownerFilter(r)
+	if pattern, ok := searchPattern(r); ok {
+		where += ` AND name LIKE ? ESCAPE '\'`
+		args = append(args, pattern)
+	}
 
 	var total int
-	if err := db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM catalog_items WHERE media_type = 'movie' AND `+ownerCond, ownerArgs...).Scan(&total); err != nil {
+	if err := db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM catalog_items WHERE media_type = 'movie' AND `+where, args...).Scan(&total); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -261,10 +289,10 @@ func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	rows, err := db.QueryContext(r.Context(), `
 		SELECT `+itemColumns+`
 		FROM catalog_items
-		WHERE media_type = 'movie' AND `+ownerCond+`
+		WHERE media_type = 'movie' AND `+where+`
 		ORDER BY name
 		LIMIT ? OFFSET ?
-	`, append(ownerArgs, limit, offset)...)
+	`, append(args, limit, offset)...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -293,6 +321,10 @@ func servePagedMovies(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 // listed iff at least one of its episodes comes from a selected source, and
 // its counts cover only those episodes — matching what the dashboard shows
 // once the row is expanded and its episodes are filtered the same way.
+//
+// `q` (see searchPattern) keeps the series whose name, or any of whose
+// episodes' names, matches. It only picks series: their counts still cover
+// every episode `owners` lets through, not just the matching ones.
 func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	limit, offset, err := parsePageParams(r)
 	if err != nil {
@@ -300,28 +332,35 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	ownerCond, ownerArgs := ownerFilter(r)
+	where, args := ownerFilter(r)
+	if pattern, ok := searchPattern(r); ok {
+		where += ` AND ` + seriesKeyExpr + ` IN (
+			SELECT ` + seriesKeyExpr + ` FROM catalog_items
+			WHERE media_type = 'episode' AND (series_name LIKE ? ESCAPE '\' OR name LIKE ? ESCAPE '\')
+		)`
+		args = append(args, pattern, pattern)
+	}
 
 	var total int
 	if err := db.QueryRowContext(r.Context(), `
 		SELECT COUNT(*) FROM (
-			SELECT 1 FROM catalog_items WHERE media_type = 'episode' AND `+ownerCond+` GROUP BY `+seriesKeyExpr+`
+			SELECT 1 FROM catalog_items WHERE media_type = 'episode' AND `+where+` GROUP BY `+seriesKeyExpr+`
 		)
-	`, ownerArgs...).Scan(&total); err != nil {
+	`, args...).Scan(&total); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	rows, err := db.QueryContext(r.Context(), `
-		SELECT `+seriesKeyExpr+` AS skey, MIN(series_name), SUM(local), COUNT(*),
+		SELECT `+seriesKeyExpr+` AS skey, `+seriesNameExpr+` AS sname, SUM(local), COUNT(*),
 		       MAX(hidden), EXISTS (SELECT 1 FROM hidden_items h WHERE h.key = `+seriesKeyExpr+`),
-		       SUM(hidden_folder)
+		       SUM(hidden_folder), MAX(series_global_id = '' AND series_name = '')
 		FROM catalog_items
-		WHERE media_type = 'episode' AND `+ownerCond+`
+		WHERE media_type = 'episode' AND `+where+`
 		GROUP BY skey
-		ORDER BY MIN(series_name)
+		ORDER BY sname, skey
 		LIMIT ? OFFSET ?
-	`, append(ownerArgs, limit, offset)...)
+	`, append(args, limit, offset)...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -332,7 +371,7 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	for rows.Next() {
 		var it seriesSummaryDTO
 		var hiddenApplied bool
-		if err := rows.Scan(&it.SeriesKey, &it.SeriesName, &it.LocalCount, &it.TotalCount, &hiddenApplied, &it.Hidden, &it.FolderHiddenCount); err != nil {
+		if err := rows.Scan(&it.SeriesKey, &it.SeriesName, &it.LocalCount, &it.TotalCount, &hiddenApplied, &it.Hidden, &it.FolderHiddenCount, &it.Orphan); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -351,8 +390,7 @@ func servePagedSeries(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 // SeriesEpisodesHandler serves GET /api/v1/items/series/episodes?key=<key>:
 // every episode row belonging to one series, keyed the same way
-// servePagedSeries groups its pages (COALESCE(series_global_id,
-// series_name)). The dashboard calls this lazily when a series row is
+// servePagedSeries groups its pages (seriesKeyExpr). The dashboard calls this lazily when a series row is
 // expanded, instead of the paginated series list embedding every episode of
 // every series on the page up front.
 func SeriesEpisodesHandler(db *sql.DB) http.HandlerFunc {
