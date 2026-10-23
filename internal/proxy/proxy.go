@@ -191,6 +191,9 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 		n, err := io.CopyBuffer(w, body, *buf)
 		copyBufferPool.Put(buf)
 		collector.RecordBytes(trafficPeer, trafficDir, n)
+		if upstreamOK {
+			collector.ObserveMaxReadWait(trafficPeer, trafficDir, tr.maxWait)
+		}
 		elapsed := time.Since(t.start)
 		attrs := append(t.attrs(), "status", resp.StatusCode, "range", rng, "size", totalSize(resp), "bytes", n,
 			"duration", elapsed.Round(time.Millisecond), "max_read_wait", tr.maxWait.Round(time.Millisecond))

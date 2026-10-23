@@ -124,15 +124,25 @@ func OpenMetricsHandler(db *sql.DB, c *Collector, registry *peers.Registry) http
 
 		c.writeStreamMetrics(&b)
 
+		// One family after the other: OpenMetrics doesn't allow interleaving
+		// them, and Prometheus would file the byte totals under the gauge.
+		traffic := resolvedSnapshot(c, registry)
+		peerIDs := make([]string, 0, len(traffic))
+		for id := range traffic {
+			peerIDs = append(peerIDs, id)
+		}
+		sort.Strings(peerIDs)
 		b.WriteString("# TYPE jellysync_traffic_bytes counter\n")
 		b.WriteString("# HELP jellysync_traffic_bytes Cumulative bytes transferred per peer and direction.\n")
+		for _, id := range peerIDs {
+			fmt.Fprintf(&b, "jellysync_traffic_bytes{peer_id=%q,direction=\"in\"} %d\n", id, traffic[id].TotalIn)
+			fmt.Fprintf(&b, "jellysync_traffic_bytes{peer_id=%q,direction=\"out\"} %d\n", id, traffic[id].TotalOut)
+		}
 		b.WriteString("# TYPE jellysync_traffic_bitrate_bytes_per_second gauge\n")
 		b.WriteString("# HELP jellysync_traffic_bitrate_bytes_per_second Current transfer rate per peer and direction.\n")
-		for peerID, t := range resolvedSnapshot(c, registry) {
-			fmt.Fprintf(&b, "jellysync_traffic_bytes{peer_id=%q,direction=\"in\"} %d\n", peerID, t.TotalIn)
-			fmt.Fprintf(&b, "jellysync_traffic_bytes{peer_id=%q,direction=\"out\"} %d\n", peerID, t.TotalOut)
-			fmt.Fprintf(&b, "jellysync_traffic_bitrate_bytes_per_second{peer_id=%q,direction=\"in\"} %f\n", peerID, t.CurrentIn)
-			fmt.Fprintf(&b, "jellysync_traffic_bitrate_bytes_per_second{peer_id=%q,direction=\"out\"} %f\n", peerID, t.CurrentOut)
+		for _, id := range peerIDs {
+			fmt.Fprintf(&b, "jellysync_traffic_bitrate_bytes_per_second{peer_id=%q,direction=\"in\"} %f\n", id, traffic[id].CurrentIn)
+			fmt.Fprintf(&b, "jellysync_traffic_bitrate_bytes_per_second{peer_id=%q,direction=\"out\"} %f\n", id, traffic[id].CurrentOut)
 		}
 
 		b.WriteString("# EOF\n")

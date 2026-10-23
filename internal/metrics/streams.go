@@ -25,6 +25,7 @@ const (
 // field is a phase that didn't happen (Connect on a reused connection) or
 // wasn't reached.
 type StreamTimings struct {
+	ConnWait  time.Duration // asking for an upstream connection to getting one: pool wait, dial and TLS
 	Connect   time.Duration // TCP connect to upstream
 	TTFB      time.Duration // request written to first response byte
 	FirstBody time.Duration // response headers to first body byte (disk read, on the serving side)
@@ -63,9 +64,10 @@ type streamKey struct {
 }
 
 type streamStats struct {
-	active                            int64
-	outcomes                          map[Outcome]uint64
-	connect, ttfb, firstBody, startup histogram
+	active                                      int64
+	outcomes                                    map[Outcome]uint64
+	connWait, connect, ttfb, firstBody, startup histogram
+	maxReadWait                                 histogram
 }
 
 // streams holds stream request counters and latency histograms. Unlike
@@ -115,11 +117,22 @@ func (c *Collector) ObserveStartup(peerID string, dir Direction, t StreamTimings
 	for _, p := range []struct {
 		h *histogram
 		d time.Duration
-	}{{&st.connect, t.Connect}, {&st.ttfb, t.TTFB}, {&st.firstBody, t.FirstBody}, {&st.startup, t.Startup}} {
+	}{{&st.connWait, t.ConnWait}, {&st.connect, t.Connect}, {&st.ttfb, t.TTFB}, {&st.firstBody, t.FirstBody}, {&st.startup, t.Startup}} {
 		if p.d > 0 {
 			p.h.observe(p.d)
 		}
 	}
+}
+
+// ObserveMaxReadWait records the longest single upstream Read of a finished
+// stream request, i.e. its worst mid-transfer stall.
+func (c *Collector) ObserveMaxReadWait(peerID string, dir Direction, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.streams.mu.Lock()
+	defer c.streams.mu.Unlock()
+	c.streams.get(peerID, dir).maxReadWait.observe(d)
 }
 
 // writeStreamMetrics appends the stream request metrics to b in
@@ -166,10 +179,12 @@ func (c *Collector) writeStreamMetrics(b *strings.Builder) {
 		name, help string
 		get        func(*streamStats) *histogram
 	}{
+		{"jellysync_stream_conn_wait_seconds", "Time from asking for an upstream connection to getting one: pool wait, dial and TLS handshake (the only phase that shows a paired peer's handshake).", func(s *streamStats) *histogram { return &s.connWait }},
 		{"jellysync_stream_connect_seconds", "TCP connect time to the stream upstream, new connections only.", func(s *streamStats) *histogram { return &s.connect }},
 		{"jellysync_stream_ttfb_seconds", "Time from the upstream request being written to its first response byte.", func(s *streamStats) *histogram { return &s.ttfb }},
 		{"jellysync_stream_first_body_seconds", "Time from upstream response headers to the first body byte.", func(s *streamStats) *histogram { return &s.firstBody }},
 		{"jellysync_stream_startup_seconds", "Time from a stream request arriving to its first body byte being ready to relay.", func(s *streamStats) *histogram { return &s.startup }},
+		{"jellysync_stream_max_read_wait_seconds", "Longest single upstream read of a finished stream request: its worst mid-transfer stall.", func(s *streamStats) *histogram { return &s.maxReadWait }},
 	} {
 		fmt.Fprintf(b, "# TYPE %s histogram\n", h.name)
 		fmt.Fprintf(b, "# HELP %s %s\n", h.name, h.help)

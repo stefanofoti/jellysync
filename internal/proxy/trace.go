@@ -77,6 +77,7 @@ func (t *timings) phases() metrics.StreamTimings {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return metrics.StreamTimings{
+		ConnWait:  between(t.getConn, t.gotConn),
 		Connect:   between(t.connectStart, t.connectDone),
 		TTFB:      between(t.wroteRequest, t.firstByte),
 		FirstBody: between(t.headers, t.firstBody),
@@ -95,7 +96,7 @@ func (t *timings) attrs() []any {
 		key string
 		d   time.Duration
 	}{
-		{"conn_wait", between(t.getConn, t.gotConn)},
+		{"conn_wait", p.ConnWait},
 		{"dns", between(t.dnsStart, t.dnsDone)},
 		{"connect", p.Connect},
 		{"tls", between(t.tlsStart, t.tlsDone)},
