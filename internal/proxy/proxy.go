@@ -5,11 +5,13 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sync"
 	"time"
 
@@ -30,6 +32,16 @@ const (
 	// on the legacy port: on the peer port the caller's key identifies it
 	// (see "Security model" in CLAUDE.md).
 	peerHeader = "X-Jellysync-Peer"
+
+	// streamIDHeader carries a stream request's id to the peer serving it,
+	// so the two nodes' log lines for one stream can be matched up. Only
+	// ever logged, never trusted.
+	streamIDHeader = "X-Jellysync-Stream-Id"
+
+	// slowStartThreshold is the startup time past which a stream start is
+	// logged at WARN with its phases, so the slow ones are visible without
+	// DEBUG logging.
+	slowStartThreshold = 3 * time.Second
 )
 
 // Handler serves "GET /api/v1/proxy/stream/{peerID}/{itemID}".
@@ -61,7 +73,10 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 		},
 	}
 
+	var bursts burstTracker
+
 	return func(w http.ResponseWriter, r *http.Request) {
+		t := newTimings()
 		peerID := r.PathValue("peerID")
 		itemID := r.PathValue("itemID")
 
@@ -99,32 +114,68 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 			return
 		}
 
+		id := streamID(r)
+		if peerID != "local" {
+			upstream.Header.Set(streamIDHeader, id)
+		}
 		rng := r.Header.Get("Range")
 		if rng != "" {
 			upstream.Header.Set("Range", rng)
 		}
-		log := slog.With("peer", peerID, "item", itemID, "direction", trafficDir, "traffic_peer", trafficPeer)
-		started := time.Now()
-		log.Debug("stream started", "range", rng)
+		log := slog.With("stream_id", id, "peer", peerID, "item", itemID, "direction", trafficDir, "traffic_peer", trafficPeer)
+		log.Debug("stream started", "range", rng, "item_requests", bursts.hit(peerID+"/"+itemID))
+
+		upstream = upstream.WithContext(httptrace.WithClientTrace(upstream.Context(), t.trace()))
+		collector.StreamStarted(trafficPeer, trafficDir)
+		outcome := metrics.OutcomeOK
+		defer func() { collector.StreamEnded(trafficPeer, trafficDir, outcome) }()
 
 		resp, err := client.Do(upstream)
 		if err != nil {
-			log.Warn("stream upstream unreachable", "upstream", upstream.URL.Redacted(), logging.Err(err))
+			var ne net.Error
+			switch {
+			case r.Context().Err() != nil:
+				outcome = metrics.OutcomeClientClosed
+				log.Debug("stream closed by client before upstream answered", append(t.attrs(), logging.Err(err))...)
+				return
+			case errors.As(err, &ne) && ne.Timeout():
+				outcome = metrics.OutcomeTimeout
+			default:
+				outcome = metrics.OutcomeUnreachable
+			}
+			log.Warn("stream upstream unreachable", append(t.attrs(), "upstream", upstream.URL.Redacted(), logging.Err(err))...)
 			http.Error(w, "upstream unreachable", http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
+		t.gotHeaders()
 
-		body := io.Reader(resp.Body)
-		if resp.StatusCode >= 400 {
+		// Startup is recorded once, on the first body byte rather than at
+		// the end, as one request may then relay a whole film. An error
+		// response's timings would only skew the histograms.
+		upstreamOK := resp.StatusCode < 400
+		tr := &timedReader{r: resp.Body, onFirst: func() {
+			t.gotFirstBody()
+			if !upstreamOK {
+				return
+			}
+			p := t.phases()
+			collector.ObserveStartup(trafficPeer, trafficDir, p)
+			if p.Startup > slowStartThreshold {
+				log.Warn("slow stream start", append(t.attrs(), "range", rng, "status", resp.StatusCode)...)
+			}
+		}}
+		body := io.Reader(tr)
+		if !upstreamOK {
+			outcome = metrics.OutcomeUpstreamErr
 			// Log a snippet of the error body so a failing peer or Jellyfin
 			// is diagnosable from this side, then still forward it in full.
 			snippet := make([]byte, errorSnippetSize)
-			n, _ := io.ReadFull(resp.Body, snippet)
+			n, _ := io.ReadFull(tr, snippet)
 			snippet = snippet[:n]
 			log.Warn("stream upstream returned an error",
 				"upstream", upstream.URL.Redacted(), "status", resp.StatusCode, "body", string(snippet))
-			body = io.MultiReader(bytes.NewReader(snippet), resp.Body)
+			body = io.MultiReader(bytes.NewReader(snippet), tr)
 		}
 
 		for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
@@ -140,16 +191,24 @@ func Handler(jf *jellyfin.Client, registry *peers.Registry, nodeID string, colle
 		n, err := io.CopyBuffer(w, body, *buf)
 		copyBufferPool.Put(buf)
 		collector.RecordBytes(trafficPeer, trafficDir, n)
-		elapsed := time.Since(started)
+		elapsed := time.Since(t.start)
+		attrs := append(t.attrs(), "status", resp.StatusCode, "range", rng, "size", totalSize(resp), "bytes", n,
+			"duration", elapsed.Round(time.Millisecond), "max_read_wait", tr.maxWait.Round(time.Millisecond))
 		switch {
 		case err != nil && r.Context().Err() != nil:
 			// The player went away mid-transfer: routine on seek/stop.
-			log.Debug("stream closed by client", "status", resp.StatusCode, "bytes", n, "duration", elapsed.Round(time.Millisecond))
+			if outcome == metrics.OutcomeOK {
+				outcome = metrics.OutcomeClientClosed
+			}
+			log.Debug("stream closed by client", attrs...)
 		case err != nil:
-			log.Warn("stream interrupted", "status", resp.StatusCode, "bytes", n, "duration", elapsed.Round(time.Millisecond), logging.Err(err))
+			if outcome == metrics.OutcomeOK {
+				outcome = metrics.OutcomeInterrupted
+			}
+			log.Warn("stream interrupted", append(attrs, logging.Err(err))...)
 		default:
-			log.Debug("stream finished", "status", resp.StatusCode, "bytes", n, "duration", elapsed.Round(time.Millisecond),
-				"mbit_per_s", fmt.Sprintf("%.1f", float64(n)*8/1e6/max(elapsed.Seconds(), 0.001)))
+			log.Debug("stream finished", append(attrs,
+				"mbit_per_s", fmt.Sprintf("%.1f", float64(n)*8/1e6/max(elapsed.Seconds(), 0.001)))...)
 		}
 	}
 }

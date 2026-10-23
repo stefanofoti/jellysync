@@ -72,6 +72,8 @@ type Collector struct {
 
 	mu    sync.RWMutex
 	peers map[string]*counters
+
+	streams streams
 }
 
 func NewCollector(ctx context.Context, db *sql.DB) (*Collector, error) {

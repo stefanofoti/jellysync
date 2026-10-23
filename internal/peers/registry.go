@@ -61,6 +61,9 @@ type Peer struct {
 	// LastSeen is when a probe last succeeded (persisted as
 	// last_seen_at); zero if never.
 	LastSeen time.Time
+	// RTT is how long the last successful /health probe took, a baseline
+	// for the network path to the peer; not persisted, 0 until probed.
+	RTT time.Duration
 
 	missed int
 	// offering is Offering as of the last heartbeat, to tell when it flips.
@@ -426,7 +429,9 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 		return
 	}
 
+	probeStart := time.Now()
 	name, version, probeErr := r.Probe(ctx, url)
+	rtt := time.Since(probeStart)
 	healthy := probeErr == nil
 	ip := resolveIP(ctx, url)
 
@@ -446,6 +451,7 @@ func (r *Registry) checkOnce(ctx context.Context, id string) {
 		p.missed = 0
 		p.State = StateOnline
 		p.LastSeen = now
+		p.RTT = rtt
 		if version != "" {
 			p.Version = version
 		}

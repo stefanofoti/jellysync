@@ -84,7 +84,8 @@ func mergeTraffic(a, b PeerTraffic) PeerTraffic {
 }
 
 // OpenMetricsHandler serves GET /metrics in OpenMetrics text exposition
-// format: library size by owner/media type, peer reachability, and
+// format: library size by owner/media type, peer reachability and
+// heartbeat RTT, stream request outcomes and startup latencies, and
 // per-peer traffic totals plus current bitrate.
 func OpenMetricsHandler(db *sql.DB, c *Collector, registry *peers.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +113,16 @@ func OpenMetricsHandler(db *sql.DB, c *Collector, registry *peers.Registry) http
 			}
 			fmt.Fprintf(&b, "jellysync_peer_up{peer_id=%q} %d\n", p.ID, up)
 		}
+
+		b.WriteString("# TYPE jellysync_peer_rtt_seconds gauge\n")
+		b.WriteString("# HELP jellysync_peer_rtt_seconds Duration of the peer's last successful /health heartbeat.\n")
+		for _, p := range registry.List() {
+			if p.RTT > 0 {
+				fmt.Fprintf(&b, "jellysync_peer_rtt_seconds{peer_id=%q} %f\n", p.ID, p.RTT.Seconds())
+			}
+		}
+
+		c.writeStreamMetrics(&b)
 
 		b.WriteString("# TYPE jellysync_traffic_bytes counter\n")
 		b.WriteString("# HELP jellysync_traffic_bytes Cumulative bytes transferred per peer and direction.\n")
